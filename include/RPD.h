@@ -1,6 +1,7 @@
 #ifndef RPDRECONSTRUCTION_H
 #define RPDRECONSTRUCTION_H
 
+#include <Export.h>
 #include <vector>
 #include <string>
 #include <map>
@@ -10,7 +11,7 @@
 
 namespace RPD
 {
-	class RPDPoint
+	class MESH_RECONSTRUCTOR_EXPORT RPDPoint
 	{
 	public:
 		RPDPoint();
@@ -64,7 +65,7 @@ namespace RPD
 	}; // class RPDPoint
 
 
-	class RPDPlane
+	class MESH_RECONSTRUCTOR_EXPORT RPDPlane
 	{
 	public:
 		RPDPlane();
@@ -82,7 +83,7 @@ namespace RPD
 	}; // class RPDPlane
 
 
-	class RPDDisk
+	class MESH_RECONSTRUCTOR_EXPORT RPDDisk
 	{
 	private:
 		int initialization_border(int seg,
@@ -115,7 +116,7 @@ namespace RPD
 	}; // class RPDDisk
 
 
-	class RPDCell
+	class MESH_RECONSTRUCTOR_EXPORT RPDCell
 	{
 	private:
 	public:
@@ -130,7 +131,7 @@ namespace RPD
 	}; // class RPDCell
 
 
-	class RPDRecon
+	class MESH_RECONSTRUCTOR_EXPORT RPDRecon
 	{
 	private:
 		double safetyAcos(double value);
@@ -168,6 +169,7 @@ namespace RPD
 		std::map<std::string, double> time_count_;
 	public:
 	}; // class RPDRecon
+
 }; // namespace RPD
 
 #endif

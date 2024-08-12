@@ -9,8 +9,9 @@
 #include <cmath>
 
 // for debug
-#define RPD_DEBUG
+// #define RPD_DEBUG
 std::string test_file_path = "..//data//RPD_TEST_";
+
 
 // CGAL
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
