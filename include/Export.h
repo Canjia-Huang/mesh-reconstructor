@@ -11,4 +11,10 @@
 #  endif
 #endif
 
+#ifdef RPD_VERBOSE
+#define RPD_DEBUG_ONLY(x) x
+#else
+#define RPD_DEBUG_ONLY(x)
+#endif
+
 #endif

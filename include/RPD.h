@@ -20,6 +20,8 @@ namespace RPD
 			double z);
 		RPDPoint(Eigen::Vector3d cor);
 		RPDPoint(Eigen::Vector3d cor,
+			Eigen::Vector3d nor);
+		RPDPoint(Eigen::Vector3d cor,
 			Eigen::Vector3d nor,
 			double weight);
 		RPDPoint& operator =(const RPDPoint& p)
@@ -62,6 +64,7 @@ namespace RPD
 		Eigen::Vector3d cor_;
 		Eigen::Vector3d nor_;
 		double			weight_ = 0;
+		bool			is_feature_ = false;
 	}; // class RPDPoint
 
 
@@ -74,11 +77,21 @@ namespace RPD
 		RPDPlane(Eigen::Vector3d cor,
 			Eigen::Vector3d nor,
 			int op_id);
+
 		bool is_on_positive_side(Eigen::Vector3d p);
 		double signed_distance_to_plane(Eigen::Vector3d p);
-	public:
+
+		Eigen::Vector3d cor();
+		Eigen::Vector3d nor();
+		int opposite_idx();
+		void set_opposite_idx(int id);
+	private:
 		Eigen::Vector3d cor_;
 		Eigen::Vector3d nor_;
+		double			a_;
+		double			b_;
+		double			c_;
+		double			d_;
 		int opposite_idx_ = -1;
 	}; // class RPDPlane
 
@@ -136,6 +149,11 @@ namespace RPD
 	private:
 		double safetyAcos(double value);
 		bool is_feature_point(RPDPoint rp);
+		bool is_feature_point(int i);
+		void output_feature_points(std::string filename,
+			double r, 
+			double g, 
+			double b);
 
 		int PoissonSurfaceReconstruction(std::vector<Eigen::Vector3d>& points,
 			std::vector<Eigen::Vector3i>& faces);
@@ -148,7 +166,13 @@ namespace RPD
 		RPDRecon(std::vector<Eigen::Vector3d> cors,
 			std::vector<Eigen::Vector3d> nors,
 			std::vector<bool> is_features);
+		int input_points(std::vector<Eigen::Vector3d> cors,
+			std::vector<Eigen::Vector3d> nors,
+			std::vector<bool> is_features);
+		double radius();
 		void set_radius(double r);
+		void set_feature_weight(double fw);
+		void set_not_feature_weight(double nfw);
 
 		int PoissonBasedReconstruction(std::vector<Eigen::Vector3i>& output_faces);
 		int ParallelDiskReconstruction(std::vector<Eigen::Vector3i>& output_faces);
@@ -157,9 +181,11 @@ namespace RPD
 
 	private:
 		std::vector<RPDPoint> points_;
+		std::vector<bool>	  is_features_;
+
 		double				  radius_			  = 0;
 
-		double				  feature_weight_	  = 1;
+		double				  feature_weight_	  = 0;
 		double				  not_feature_weight_ = 0;
 
 		double				  connect_angle_constraint_		  = 100;

@@ -10,8 +10,7 @@
 
 // for debug
 // #define RPD_DEBUG
-std::string test_file_path = "..//data//RPD_TEST_";
-
+std::string test_file_path = "..//data//RPD_";
 
 // CGAL
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
@@ -41,6 +40,10 @@ typedef nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L2_Simple_Adaptor<double,
 
 namespace RPD
 {
+    RPDRecon::RPDRecon()
+    {
+    }
+
     RPDRecon::RPDRecon(std::vector<Eigen::Vector3d> cors,
         std::vector<Eigen::Vector3d> nors,
         std::vector<bool> is_features)
@@ -51,25 +54,134 @@ namespace RPD
             {
                 if (is_features[i])
                 {
-                    points_.push_back(RPDPoint(cors[i], nors[i], feature_weight_));
+                    points_.push_back(RPDPoint(cors[i], nors[i]));
+                    is_features_.push_back(true);
                 }
                 else
                 {
-                    points_.push_back(RPDPoint(cors[i], nors[i], not_feature_weight_));
+                    points_.push_back(RPDPoint(cors[i], nors[i]));
+                    is_features_.push_back(false);
                 }
 
             }
         }
         else
         {
-            std::cout << "RPDrecon::RPDrecon input vector size error!" << std::endl;
+            RPD_DEBUG_ONLY(std::cout << "RPDrecon::RPDrecon input vector size error!" << std::endl;)
             return;
         }
+
+#ifdef RPD_DEBUG
+        if (1)
+        {
+            std::ofstream out(test_file_path + "input_points.obj");
+            for (int i = 0; i < points_.size(); i++)
+            {
+                out << "v" << " " << points_[i].cor_.transpose() << std::endl;
+            }
+            out.close();
+        }
+#endif
+    }
+
+    int RPDRecon::input_points(std::vector<Eigen::Vector3d> cors,
+        std::vector<Eigen::Vector3d> nors,
+        std::vector<bool> is_features)
+    {
+        if (cors.size() == nors.size() && nors.size() == is_features.size())
+        {
+            for (int i = 0; i < cors.size(); i++)
+            {
+                if (is_features[i])
+                {
+                    points_.push_back(RPDPoint(cors[i], nors[i], feature_weight_));
+                    is_features_.push_back(true);
+                }
+                else
+                {
+                    points_.push_back(RPDPoint(cors[i], nors[i], not_feature_weight_));
+                    is_features_.push_back(false);
+                }
+
+            }
+        }
+        else
+        {
+            RPD_DEBUG_ONLY(std::cout << "RPDrecon::RPDrecon input vector size error!" << std::endl;)
+                return 0;
+        }
+#ifdef RPD_DEBUG
+        if (1)
+        {
+            std::ofstream out(test_file_path + "input_points.obj");
+            for (int i = 0; i < points_.size(); i++)
+            {
+                out << "v" << " " << points_[i].cor_.transpose() << std::endl;
+            }
+            out.close();
+        }
+#endif
+
+#ifdef RPD_DEBUG
+        if (1)
+        {
+            RPDRecon::output_feature_points(test_file_path + "input_points_features.obj", 255, 0, 0);
+        }
+#endif
+
+        return 1;
+    }
+
+    double RPDRecon::radius()
+    {
+        return radius_;
     }
 
     void RPDRecon::set_radius(double r)
     {
+        RPD_DEBUG_ONLY(if (r <= 0) std::cout << "RPDRecon::set_radius radius may invalid!" << std::endl;)
+
         radius_ = r;
+    }
+
+    void RPDRecon::set_feature_weight(double fw)
+    {
+        feature_weight_ = fw;
+
+        for (int i = 0; i < points_.size(); i++)
+        {
+            if (is_features_[i])
+            {
+                points_[i].weight_ = fw;
+            }
+        }
+
+#ifdef RPD_DEBUG
+        if (1)
+        {
+            RPDRecon::output_feature_points(test_file_path + "input_points_features.obj", 255, 0, 0);
+        }
+#endif
+    }
+
+    void RPDRecon::set_not_feature_weight(double nfw)
+    {
+        not_feature_weight_ = nfw;
+
+        for (int i = 0; i < points_.size(); i++)
+        {
+            if (is_features_[i] == false)
+            {
+                points_[i].weight_ = nfw;
+            }
+        }
+
+#ifdef RPD_DEBUG
+        if (1)
+        {
+            RPDRecon::output_feature_points(test_file_path + "input_points_features.obj", 255, 0, 0);
+        }
+#endif
     }
 
     double RPDRecon::safetyAcos(double value)
@@ -84,12 +196,26 @@ namespace RPD
         return (rp.weight_ == feature_weight_);
     }
 
+    bool RPDRecon::is_feature_point(int i)
+    {
+        if (i < 0 || i > is_features_.size())
+        {
+            RPD_DEBUG_ONLY(std::cout << "RPDRecon::is_feature_point input invalid!" << std::endl;)
+            return false;
+        }
+
+        return is_features_[i];
+    }
+
+    // functional
     int RPDRecon::PoissonSurfaceReconstruction(std::vector<Eigen::Vector3d>& points,
         std::vector<Eigen::Vector3i>& faces)
     {
+        std::string test_func_name = "PS_";
+
         if (points_.size() == 0)
         {
-            std::cout << "PoissonSurfaceReconstruction::input point array is empty!" << std::endl;
+            RPD_DEBUG_ONLY(std::cout << "PoissonSurfaceReconstruction::input point array is empty!" << std::endl;)
             return 0;
         }
 
@@ -110,6 +236,7 @@ namespace RPD
 
         double average_spacing = CGAL::compute_average_spacing<CGAL::Sequential_tag>
             (pwn_points, 6, CGAL::parameters::point_map(CGAL::First_of_pair_property_map<K_Pwn>()));
+        average_spacing *= 0.5;
 
         Polyhedron output_mesh;
         if (CGAL::poisson_surface_reconstruction_delaunay
@@ -136,7 +263,7 @@ namespace RPD
 
                 if (face_vertices_idx.size() != 3)
                 {
-                    std::cout << "PoissonSurfaceReconstruction::CGAL::poisson_surface_reconstruction_delaunay output error!" << std::endl;
+                    RPD_DEBUG_ONLY(std::cout << "PoissonSurfaceReconstruction::CGAL::poisson_surface_reconstruction_delaunay output error!" << std::endl;)
                     return 0;
                 }
 
@@ -150,7 +277,7 @@ namespace RPD
 #ifdef RPD_DEBUG
             if (1)
             {
-                std::ofstream out(test_file_path + "Poisson_Surface.obj");
+                std::ofstream out(test_file_path + test_func_name + "surface.obj");
                 for (int i = 0; i < points.size(); i++)
                 {
                     out << "v" << " " << points[i].x() << " " << points[i].y() << " " << points[i].z() << std::endl;
@@ -165,13 +292,13 @@ namespace RPD
         }
         else
         {
-            std::cout << "PoissonSurfaceReconstruction::CGAL::poisson_surface_reconstruction_delaunay error!" << std::endl;
+            RPD_DEBUG_ONLY(std::cout << "PoissonSurfaceReconstruction::CGAL::poisson_surface_reconstruction_delaunay error!" << std::endl;)
             return 0;
         }
 
         if (points.size() == 0 || faces.size() == 0)
         {
-            std::cout << "PoissonSurfaceReconstruction::CGAL::poisson_surface_reconstruction_delaunay null!" << std::endl;
+            RPD_DEBUG_ONLY(std::cout << "PoissonSurfaceReconstruction::CGAL::poisson_surface_reconstruction_delaunay null!" << std::endl;)
             return 0;
         }
 
@@ -186,14 +313,16 @@ namespace RPD
 
 	int RPDRecon::RegularTriangulation(std::vector<std::vector<int>>& RT_neighbors_o)
 	{
+        std::string test_func_name = "RT_";
+
         if (radius_ == 0)
         {
-            std::cout << "RegularTriangulation::radius is invalid!" << std::endl;
+            RPD_DEBUG_ONLY(std::cout << "RegularTriangulation::radius is invalid!" << std::endl;)
             return 0;
         }
         if (points_.size() == 0)
         {
-            std::cout << "RegularTriangulation::input point array is empty!" << std::endl;
+            RPD_DEBUG_ONLY(std::cout << "RegularTriangulation::input point array is empty!" << std::endl;)
             return 0;
         }
 
@@ -207,7 +336,7 @@ namespace RPD
 		for (int i = 0; i < points_.size(); i++)
 		{
             point_to_idx[points_[i]] = i;
-			w_points.push_back(K_WPoint(K_Point(points_[i].cor_.x(), points_[i].cor_.y(), points_[i].cor_.z()), pow(points_[i].weight_ * radius_, 2)));
+			w_points.push_back(K_WPoint(K_Point(points_[i].cor_.x(), points_[i].cor_.y(), points_[i].cor_.z()), pow(points_[i].weight_, 2)));
 		}
 
         // regular triangulation
@@ -215,14 +344,14 @@ namespace RPD
 
         if (!RT.is_valid())
         {
-            std::cout << "RegularTriangulation::Regular_triangulation error!" << std::endl;
+            RPD_DEBUG_ONLY(std::cout << "RegularTriangulation::Regular_triangulation error!" << std::endl;)
             return 0;
         }
 
 #ifdef RPD_DEBUG
         if (1)
         {
-            std::ofstream rt_vis_out(test_file_path + "RT.obj");
+            std::ofstream rt_vis_out(test_file_path + test_func_name + "connection.obj");
             std::map<RPDPoint, int> point_to_idx;
             int rt_cnt = 1;
             for (const Regular_triangulation::Vertex_handle vh : RT.finite_vertex_handles())
@@ -305,7 +434,7 @@ namespace RPD
         if (1)
         {
             std::map<std::pair<int, int>, bool> edge_map;
-            std::ofstream rt_vis(test_file_path + "RT2.obj");
+            std::ofstream rt_vis(test_file_path + test_func_name + "connection_processed.obj");
             for (int i = 0; i < points_.size(); i++)
             {
                 rt_vis << "v " << points_[i].cor_.x() << " " << points_[i].cor_.y() << " " << points_[i].cor_.z() << std::endl;
@@ -338,6 +467,8 @@ namespace RPD
 
     int RPDRecon::PoissonBasedReconstruction(std::vector<Eigen::Vector3i>& output_faces)
     {
+        std::string test_func_name = "PBR_";
+
         if (radius_ == 0)
         {
             std::vector<K_Point> KP_points;
@@ -369,7 +500,7 @@ namespace RPD
         std::vector<Eigen::Vector3i> poisson_faces; // poisson model's neighbor faces of each poisson vertex
         if (PoissonSurfaceReconstruction(poisson_vertices, poisson_faces) == 0)
         {
-            std::cout << "PoissonBasedReconstruction::PoissonSurfaceReconstruction error!" << std::endl;
+            RPD_DEBUG_ONLY(std::cout << "PoissonBasedReconstruction::PoissonSurfaceReconstruction error!" << std::endl;)
             return 0;
         }
 
@@ -391,7 +522,7 @@ namespace RPD
         // build poisson model vertices' kd tree
         PointCloud<double> poisson_vertices_cloud;
         nanoflann::SearchParams params;
-        const double poisson_search_radius = static_cast<double>(pow(radius_ * 2, 2));
+        const double poisson_search_radius = static_cast<double>(pow(5 * radius_, 2));
         // std::cout << poisson_search_radius << std::endl;
         poisson_vertices_cloud.pts.resize(poisson_vertices.size());
         for (int i = 0; i < poisson_vertices.size(); i++)
@@ -408,13 +539,12 @@ namespace RPD
         std::vector<std::vector<int>> RT_neighbors;
         if (RegularTriangulation(RT_neighbors) == 0)
         {
-            std::cout << "PoissonBasedReconstruction::RegularTriangulation error!" << std::endl;
+            RPD_DEBUG_ONLY(std::cout << "PoissonBasedReconstruction::RegularTriangulation error!" << std::endl;)
             return 0;
         }
 
-
         // process each point
-        for (int i = 0; i < points_.size(); i++) //prepare for openmp
+        for (int i = 0; i < points_.size(); i++) // prepare for openmp
         {
             RPDCell* PC = new RPDCell(points_[i].cor_);
             PCs[i] = PC;
@@ -422,7 +552,7 @@ namespace RPD
 //#pragma omp parallel for
         for (int i = 0; i < points_.size(); i++)
         {
-            if (i % 1000 == 0) std::cout << "processed point:" << " " << i << std::endl;
+            RPD_DEBUG_ONLY(if (i % 1000 == 0) std::cout << "processed point:" << " " << i << std::endl;)
 
             RPDCell* PC = PCs[i]; // point(i)'s cell
 
@@ -432,13 +562,22 @@ namespace RPD
             {
                 int neighbor_idx = RT_neighbors[i][j];
 
-                double w1 = points_[i].weight_ * radius_;
-                double w2 = points_[neighbor_idx].weight_ * radius_;
+                double w1 = points_[i].weight_;
+                double w2 = points_[neighbor_idx].weight_;
 
-                double lambda = ((w1 * w1 - w2 * w2) / (points_[i].cor_ - points_[neighbor_idx].cor_).squaredNorm() + 1.0) / 2.0; // power diagram
-                // double lambda = 0.5; // voronoi diagram
+                Eigen::Vector3d mid_point;
+                if (1)
+                {
+                    // power diagram
+                    double lambda = 0.5 + 0.5 * (w1 * w1 - w2 * w2) / (points_[i].cor_ - points_[neighbor_idx].cor_).squaredNorm();
+                    mid_point = lambda * points_[i].cor_ + (1 - lambda) * points_[neighbor_idx].cor_;
+                }
+                else
+                {
+                    // voronoi diagram
+                    mid_point = 0.5 * (points_[i].cor_ + points_[neighbor_idx].cor_);
+                }
 
-                Eigen::Vector3d mid_point = (1 - lambda) * points_[i].cor_ + lambda * points_[neighbor_idx].cor_;
                 Eigen::Vector3d dir = points_[neighbor_idx].cor_ - points_[i].cor_;
 
                 RPDPlane mid_point_plane(mid_point, dir, neighbor_idx);
@@ -452,7 +591,7 @@ namespace RPD
             for (int j = 0; j < PC->cutted_planes_.size(); j++)
             {
                 RPDPlane plane = PC->cutted_planes_[j];
-                std::pair<int, int> cur_edge_pair = std::make_pair(std::min(i, plane.opposite_idx_), std::max(i, plane.opposite_idx_));
+                std::pair<int, int> cur_edge_pair = std::make_pair(std::min(i, plane.opposite_idx()), std::max(i, plane.opposite_idx()));
 
                 if (RPD_edges_check.find(cur_edge_pair) == RPD_edges_check.end())
                 {
@@ -468,31 +607,34 @@ namespace RPD
 
             // find poisson model's nearest face
             std::set<int> poisson_nearest_faces; // point(i)'s nearest poisson faces
-            double query_pt[3] = { points_[i].cor_.x(), points_[i].cor_.y(), points_[i].cor_.z() };
-            std::vector<std::pair<uint32_t, double>> poisson_ret_matches;
-            double cur_poisson_search_radius = poisson_search_radius;
-            while (1)
+            if (1)
             {
-                const size_t poisson_nMatches = poisson_vertices_index.radiusSearch(&query_pt[0], cur_poisson_search_radius, poisson_ret_matches, params);
+                double query_pt[3] = { points_[i].cor_.x(), points_[i].cor_.y(), points_[i].cor_.z() };
+                std::vector<std::pair<uint32_t, double>> poisson_ret_matches;
+                double cur_poisson_search_radius = poisson_search_radius;
+                while (1)
+                {
+                    const size_t poisson_nMatches = poisson_vertices_index.radiusSearch(&query_pt[0], cur_poisson_search_radius, poisson_ret_matches, params);
 
-                if (poisson_nMatches == 0)
-                {
-                    // std::cout << "cur_search_radius:" << " " << cur_poisson_search_radius << std::endl;
-                    cur_poisson_search_radius *= 2;
-                }
-                else
-                {
-                    for (int j = 0; j < poisson_nMatches; j++)
+                    if (poisson_nMatches == 0)
                     {
-                        for (int jj = 0; jj < poisson_neighbor_faces[poisson_ret_matches[j].first].size(); jj++)
-                        {
-                            poisson_nearest_faces.insert(poisson_neighbor_faces[poisson_ret_matches[j].first][jj]);
-                        }
+                        // std::cout << "cur_search_radius:" << " " << cur_poisson_search_radius << std::endl;
+                        cur_poisson_search_radius *= 2;
                     }
-                    break;
+                    else
+                    {
+                        for (int j = 0; j < poisson_nMatches; j++)
+                        {
+                            for (int jj = 0; jj < poisson_neighbor_faces[poisson_ret_matches[j].first].size(); jj++)
+                            {
+                                poisson_nearest_faces.insert(poisson_neighbor_faces[poisson_ret_matches[j].first][jj]);
+                            }
+                        }
+                        break;
+                    }
                 }
             }
-            /* // knnSearch
+            /* // knn search poisson nearest face
             int knn_search_num = 6;
             std::vector<uint32_t> poisson_ret_index(knn_search_num);
             std::vector<double> poisson_out_dist_sqr(knn_search_num);
@@ -567,7 +709,7 @@ namespace RPD
             // process poisson cutted faces
             for (int j = 0; j < poisson_cutted_faces.size(); j++)
             {
-                if (poisson_cutted_faces.size() > 10000) break; // test
+                RPD_DEBUG_ONLY(if (poisson_cutted_faces.size() % 1000  < 2) std::cout << "cur poisson_cutted_faces size:" << " " << poisson_cutted_faces.size() << std::endl;)
 
                 std::vector<Eigen::Vector3d> cur_f = poisson_cutted_faces[j]; // cur poisson_cutted_face
 
@@ -640,7 +782,7 @@ namespace RPD
                     if (found_cut_face)
                     {
                         new_face = new_face_tmp;
-                        fdp = cur_plane.opposite_idx_;
+                        fdp = cur_plane.opposite_idx();
                     }
                 }
 
@@ -843,8 +985,8 @@ namespace RPD
                             }*/
 
                             a = i;
-                            b = plane1.opposite_idx_;
-                            c = plane2.opposite_idx_;
+                            b = plane1.opposite_idx();
+                            c = plane2.opposite_idx();
 
                             RPD_cell_triangles[i].push_back(Eigen::Vector3i(a, b, c));
                         }
@@ -853,7 +995,6 @@ namespace RPD
             }
         } // point(i)
 
-        // std::cout << "checkpoint!" << std::endl;
 
         // check if inside other RPD
         std::map<int, bool> is_inside_other_RPD;
@@ -914,7 +1055,7 @@ namespace RPD
 #ifdef RPD_DEBUG
         if (1)
         {
-            std::ofstream RPD_out(test_file_path + "RPD.obj");
+            std::ofstream RPD_out(test_file_path + test_func_name + "restricted_power_diagram.obj");
             std::map<RPDPoint, int> RPDPoint_to_idx;
             int pn = 0;
             for (const auto e : RPD_cell_connects)
@@ -1065,7 +1206,7 @@ namespace RPD
 #ifdef RPD_DEBUG
         if (1)
         {
-            std::ofstream RPDrecon_out(test_file_path + "PoissonBased_Reconstruction.obj");
+            std::ofstream RPDrecon_out(test_file_path + test_func_name + "reconstruction.obj");
             for (int i = 0; i < points_.size(); i++)
             {
                 RPDrecon_out << "v" << " " << points_[i].cor_.x() << " " << points_[i].cor_.y() << " " << points_[i].cor_.z() << std::endl;
@@ -1088,6 +1229,8 @@ namespace RPD
 
     int RPDRecon::ParallelDiskReconstruction(std::vector<Eigen::Vector3i>& output_faces)
     {
+        std::string test_func_name = "PDR_";
+
         int numProcs = omp_get_num_procs();
         omp_set_num_threads(2 * numProcs - 1);
 
@@ -1168,11 +1311,11 @@ namespace RPD
             {
                 RPDPlane cur_plane = disk->border_planes_[j];
 
-                if (cur_plane.opposite_idx_ == -1)
+                if (cur_plane.opposite_idx() == -1)
                 {
                     continue;
                 }
-                disk_map[cur_plane.opposite_idx_] = true;
+                disk_map[cur_plane.opposite_idx()] = true;
             }
             RPD_neighbors[i] = disk_map;
         }
@@ -1190,7 +1333,7 @@ namespace RPD
             std::vector<bool> is_good_plane;
             for (int j = 0; j < disk->border_planes_.size(); j++)
             {
-                int opposite_idx = disk->border_planes_[j].opposite_idx_;
+                int opposite_idx = disk->border_planes_[j].opposite_idx();
 
                 if (opposite_idx == -1)
                 {
@@ -1218,8 +1361,8 @@ namespace RPD
                 }
 
                 int a = i;
-                int b = disk->border_planes_[j].opposite_idx_;
-                int c = disk->border_planes_[next_j].opposite_idx_;
+                int b = disk->border_planes_[j].opposite_idx();
+                int c = disk->border_planes_[next_j].opposite_idx();
 
                 if (b == -1 || c == -1)
                 {
@@ -1373,7 +1516,7 @@ namespace RPD
 #ifdef RPD_DEBUG
         if (1)
         {
-            std::ofstream disk_out(test_file_path + "Disks.obj");
+            std::ofstream disk_out(test_file_path + test_func_name + "disks.obj");
             std::map<RPDPoint, int> rp_to_idx;
             int rp_point_cnt = points_.size();
             for (int i = 0; i < points_.size(); i++)
@@ -1415,7 +1558,7 @@ namespace RPD
 #ifdef RPD_DEBUG
         if (1)
         {
-            std::ofstream disk_out(test_file_path + "Disks_Connection.obj");
+            std::ofstream disk_out(test_file_path + test_func_name + "disks_connection.obj");
             for (int i = 0; i < points_.size(); i++)
             {
                 disk_out << "v" << " " << points_[i].cor_.transpose() << std::endl;
@@ -1439,7 +1582,7 @@ namespace RPD
 #ifdef RPD_DEBUG
         if (1)
         {
-            std::ofstream good_out(test_file_path + "Triangles_Good.obj");
+            std::ofstream good_out(test_file_path + test_func_name + "triangle_good.obj");
             for (int i = 0; i < points_.size(); i++)
             {
                 good_out << "v" << " " << points_[i].cor_.transpose() << std::endl;
@@ -1450,7 +1593,7 @@ namespace RPD
             }
             good_out.close();
 
-            std::ofstream not_bad_out(test_file_path + "Triangles_Not_Bad.obj");
+            std::ofstream not_bad_out(test_file_path + test_func_name + "triangle_not_bad.obj");
             for (int i = 0; i < points_.size(); i++)
             {
                 not_bad_out << "v" << " " << points_[i].cor_.transpose() << std::endl;
@@ -1461,7 +1604,7 @@ namespace RPD
             }
             not_bad_out.close();
 
-            std::ofstream bad_out(test_file_path + "Triangles_Bad.obj");
+            std::ofstream bad_out(test_file_path + test_func_name + "triangle_bad.obj");
             for (int i = 0; i < points_.size(); i++)
             {
                 bad_out << "v" << " " << points_[i].cor_.transpose() << std::endl;
@@ -1477,7 +1620,7 @@ namespace RPD
 #ifdef RPD_DEBUG
         if (1)
         {
-            std::ofstream out(test_file_path + "ParallelDisk_Reconstruction.obj");
+            std::ofstream out(test_file_path + test_func_name + "reconstruction.obj");
             for (int i = 0; i < points_.size(); i++)
             {
                 out << "v" << " " << points_[i].cor_.transpose() << std::endl;
@@ -1497,6 +1640,7 @@ namespace RPD
         return 1;
     }
 
+    //others
     void RPDRecon::RecordTimeCount(std::string func_name,
         double time)
     {
@@ -1516,6 +1660,34 @@ namespace RPD
         for (auto tc : time_count_)
         {
             std::cout << tc.first << ":" << "\t" << tc.second << ".sec" << std::endl;
+        }
+    }
+
+    void RPDRecon::output_feature_points(std::string filename,
+        double r,
+        double g,
+        double b)
+    {
+        r = std::min(std::max(r, double(0)), double(255));
+        g = std::min(std::max(g, double(0)), double(255));
+        b = std::min(std::max(b, double(0)), double(255));
+
+        Eigen::Vector3d color(r, g, b);
+        double min_weight = MAX;
+        double max_weight = -MAX;
+        for (int i = 0; i < points_.size(); i++)
+        {
+            min_weight = std::min(min_weight, points_[i].weight_);
+            max_weight = std::max(max_weight, points_[i].weight_);
+        }
+        if (abs(max_weight - min_weight) > EPS)
+        {
+            std::ofstream out(filename);
+            for (int i = 0; i < points_.size(); i++)
+            {
+                out << "v" << " " << points_[i].cor_.transpose() << " " << (color * (points_[i].weight_ - min_weight) / (max_weight - min_weight)).transpose() << std::endl;
+            }
+            out.close();
         }
     }
 } //namespace RPD

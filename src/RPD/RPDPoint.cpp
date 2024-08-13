@@ -26,6 +26,13 @@ namespace RPD
     }
 
     RPDPoint::RPDPoint(Eigen::Vector3d cor,
+        Eigen::Vector3d nor)
+    {
+        cor_ = cor;
+        nor_ = nor;
+    };
+
+    RPDPoint::RPDPoint(Eigen::Vector3d cor,
         Eigen::Vector3d nor,
         double weight)
     {
