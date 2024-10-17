@@ -1,12 +1,11 @@
-#include "RPD.h"
+#include "RPD/RPD.h"
 
 // Eigen
 #include <Eigen/Dense>
 
 namespace RPD
 {
-    RPDPoint::RPDPoint()
-    {
+    RPDPoint::RPDPoint() {
         cor_ = Eigen::Vector3d(0, 0, 0);
         nor_ = Eigen::Vector3d(0, 0, 0);
     }

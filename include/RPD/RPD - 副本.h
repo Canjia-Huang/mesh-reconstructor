@@ -1,5 +1,5 @@
-#ifndef RPDRECONSTRUCTION_H
-#define RPDRECONSTRUCTION_H
+#ifndef MESH_RECONSTRUCTOR_RPD_H_
+#define MESH_RECONSTRUCTOR_RPD_H_
 
 #include <Export.h>
 #include <vector>
@@ -9,10 +9,8 @@
 // Eigen
 #include <Eigen/Dense>
 
-namespace RPD
-{
-	class MESH_RECONSTRUCTOR_EXPORT RPDPoint
-	{
+namespace RPD {
+	class MESH_RECONSTRUCTOR_EXPORT RPDPoint {
 	public:
 		RPDPoint();
 		RPDPoint(double x,
