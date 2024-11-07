@@ -5,7 +5,7 @@
 #include <Point.hpp>
 
 namespace MeshReconstructorRPD {
-	class MESH_RECONSTRUCTOR_EXPORT RPDPoint: public MeshReconstructor::Point {
+	class RPDPoint: public MeshReconstructor::Point {
 	public:
 		RPDPoint() {
 			cor_ = Eigen::Vector3d(0, 0, 0);

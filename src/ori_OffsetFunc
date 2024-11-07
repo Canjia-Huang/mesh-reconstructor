@@ -1,0 +1,3819 @@
+/*****************************************************************//**
+ * \file   OffsetFunc.cpp
+ * \brief  The implementation of functions for offset operations
+ * 
+ * \author Canjia Huang
+ * \date   March 2024
+ *********************************************************************/
+#include "ErrorType.h"
+#include "OffsetFunc.h"
+#include "GaussMapCluster.h"
+#include "RPD.h"
+
+#define PI			3.1415926
+#define EPS			1e-6
+#define PRECIES_EPS 1e-12
+#define MAX			1e6
+#define SIGN(x) ((x<0)? -1 : 1)
+
+// QEM
+#include <qem/Simplify.h>
+
+bool DEBUG_MODE = true;		// output debug file
+
+using namespace std;
+
+int readOBJ(string OBJpath,
+	vector<Eigen::Vector3d>& points,
+	vector<Eigen::Vector3i>& faces)
+{
+	// init
+	points.clear();
+	faces.clear();
+
+	ifstream in(OBJpath);
+	if (!in.good())
+	{
+		return OBJFILEERROR;
+	}
+
+	string sline, s0;
+	string vertex_char = "v";
+	string face_char = "f";
+	while (getline(in, sline))
+	{
+		istringstream ins(sline);
+		ins >> s0;
+
+		if (s0 == vertex_char)
+		{
+			//istringstream ins(sline);
+			Eigen::Vector3d p;
+			ins >> p.x() >> p.y() >> p.z();
+			// cout << p.x() << p.y() << p.z() << endl;
+			points.push_back(p);
+		}
+		else if (s0 == face_char)
+		{
+			//istringstream ins(sline);
+
+			while (!ins.eof())
+			{
+				vector<string> s_v(3);
+				ins >> s_v[0] >> s_v[1] >> s_v[2];
+
+				// cout << s_v[0] << " " << s_v[1] << " " << s_v[2] << endl;
+				for (int i = 0; i < 3; i++)
+				{
+					for (int j = 0; j < s_v[i].size(); j++)
+					{
+						if (int(s_v[i][j]) == 47)
+						{
+							s_v[i] = s_v[i].substr(0, j);
+							break;
+						}
+					}
+				}
+				// cout << s_v[0] << " " << s_v[1] << " " <<  s_v[2] << endl;
+
+				Eigen::Vector3i f;
+				istringstream(s_v[0]) >> f.x();
+				istringstream(s_v[1]) >> f.y();
+				istringstream(s_v[2]) >> f.z();
+				f.x() = f.x() - 1;
+				f.y() = f.y() - 1;
+				f.z() = f.z() - 1;
+				faces.push_back(f);
+
+				ins >> s0;
+				//cout << s0 << endl;
+
+				if (s0 == "f")
+				{
+					break;
+				}
+				else if (s0 == "#")
+				{
+					break;
+				}
+				else
+				{
+					istringstream ss(s0);
+					int f4;
+					ss >> f4;
+					f4 = f4 - 1;
+
+					Eigen::Vector3i f1(f.z(), f4, f.x());
+					faces.push_back(f1);
+					break;
+				}
+			}
+		}
+	}
+	in.close();
+
+	/*
+	for (int i = 0; i < faces.size(); i++)
+	{
+		cout << faces[i].x() << " " << faces[i].y() << " " << faces[i].z() << endl;
+	}
+	cout << endl;*/
+
+
+	return READOBJSUCCESS;
+}
+
+int saveOBJ(std::string OBJpath,
+	std::vector<Eigen::Vector3d> points,
+	std::vector<Eigen::Vector3i> faces)
+{
+	ofstream out(OBJpath);
+	for (int i = 0; i < points.size(); i++)
+	{
+		out << "v" << " " << points[i].x() << " " << points[i].y() << " " << points[i].z() << endl;
+	}
+	for (int i = 0; i < faces.size(); i++)
+	{
+		out << "f" << " " << faces[i].x() + 1 << " " << faces[i].y() + 1 << " " << faces[i].z() + 1 << endl;
+	}
+	out.close();
+
+	return 1;
+}
+
+int readOFF(string OFFpath,
+	vector<Eigen::Vector3d>& points,
+	vector<Eigen::Vector3i>& faces)
+{
+	// init
+	points.clear();
+	faces.clear();
+	int vertex_num;
+	int face_num;
+	int edge_num;
+	int s;
+
+	ifstream in(OFFpath);
+	if (!in.good())
+	{
+		return OFFFILEERROR;
+	}
+	do
+	{
+		in.get();
+	} while (in.get() != '\n');
+	in >> vertex_num >> face_num >> edge_num;
+	for (int i = 0; i < vertex_num; i++)
+	{
+		Eigen::Vector3d p;
+		in >> p.x() >> p.y() >> p.z();
+		points.push_back(p);
+	}
+	for (int i = 0; i < face_num; i++)
+	{
+		Eigen::Vector3i f;
+		in >> s;
+		in >> f.x() >> f.y() >> f.z();
+		if (s == 3)
+		{
+			faces.push_back(f);
+		}
+		else if (s == 4)
+		{
+			int f4;
+			in >> f4;
+			faces.push_back(f);
+			faces.push_back(Eigen::Vector3i(f.z(), f4, f.x()));
+		}
+	}
+	in.close();
+
+	return READOFFSUCCESS;
+}
+
+double rad2ang(double rad)
+{
+	return rad * 180 / PI;
+}
+
+double ang2rad(double ang)
+{
+	return ang / 180 * PI;
+}
+
+double safetyAsin(double value)
+{
+	if (value < -1.0f) value = -1.0f;
+	if (value > 1.0f) value = 1.0f;
+	return rad2ang(asin(value));
+}
+
+double safetyAcos(double value)
+{
+	if (value < -1.0f) value = -1.0f;
+	if (value > 1.0f) value = 1.0f;
+	return rad2ang(acos(value));
+}
+
+int IsOpenMesh(MyMesh mesh)
+{
+	vector<Eigen::Vector2i> open_boundary;
+
+	for (MyMesh::HalfedgeIter h_it = mesh.halfedges_begin(); h_it != mesh.halfedges_end(); h_it++)
+	{
+		if (mesh.is_boundary(*h_it))
+		{
+			if (DEBUG_MODE)
+			{
+				int p1 = mesh.from_vertex_handle(*h_it).idx();
+				int p2 = mesh.to_vertex_handle(*h_it).idx();
+				open_boundary.push_back(Eigen::Vector2i(p1, p2));
+			}
+			else
+			{
+				return 1;
+			}
+		}
+	}
+
+	if (DEBUG_MODE)
+	{
+		if (open_boundary.size() == 0) return 0;
+
+		ofstream ob_out("..//data//0_Open_Boundary.obj");
+		for (int i = 0; i < mesh.n_vertices(); i++)
+		{
+			MyMesh::Point p = mesh.point(mesh.vertex_handle(i));
+			ob_out << "v" << " " << p[0] << " " << p[1] << " " << p[2] << endl;
+		}
+		for (int i = 0; i < open_boundary.size(); i++)
+		{
+			ob_out << "l" << " " << open_boundary[i][0] + 1 << " " << open_boundary[i][1] + 1 << endl;
+		}
+
+		return 1;
+	}
+
+	return 0;
+}
+
+int saveMyMesh(MeshInfo& Mesh,
+	string outputpath)
+{
+	if (Mesh.mesh.n_faces() == 0)
+	{
+		return SAVEMESHERROR;
+	}
+	if (outputpath.length() < 4)
+	{
+		return SAVEPATHERROR;
+	}
+
+	ofstream out(outputpath);
+	for (int i = 0; i < Mesh.mesh.n_vertices(); i++)
+	{
+		MyMesh::Point p = Mesh.mesh.point(Mesh.mesh.vertex_handle(i));
+		out << "v" << " " << p[0] << " " << p[1] << " " << p[2] << endl;
+	}
+	for (int i = 0; i < Mesh.mesh.n_faces(); i++)
+	{
+		MyMesh::FaceHandle fh = Mesh.mesh.face_handle(i);
+		vector<int> fp_idx;
+		for (MyMesh::FaceVertexIter fv_it = Mesh.mesh.fv_iter(fh); fv_it.is_valid(); ++fv_it)
+		{
+			fp_idx.push_back((*fv_it).idx());
+		}
+		if (fp_idx.size() != 3) continue;
+		int i1 = fp_idx[0];
+		int i2 = fp_idx[1];
+		int i3 = fp_idx[2];
+
+		out << "f" << " " << i1 + 1 << " " << i2 + 1 << " " << i3 + 1 << endl;
+	}
+	out.close();
+
+	return SAVESUCCESS;
+}
+
+MyMesh::Normal Slerp(MyMesh::Normal vec_f,
+	MyMesh::Normal vec_t,
+	MyMesh::Normal rotated_vec,
+	double ang)
+{
+	ang = ang / 180 * PI;
+
+	MyMesh::Normal r = rotated_vec.normalized();
+	if (isnan(r[0]) || isnan(r[1]) || isnan(r[2]))
+	{
+		return vec_f;
+	}
+
+	MyMesh::Normal res = (cos(ang) * vec_f + (1 - cos(ang)) * (vec_f | r) * r + sin(ang) * (r % vec_f)).normalized();
+	if (isnan(res[0]) || isnan(res[1]) || isnan(res[2]))
+	{
+		return vec_f;
+	}
+
+	return res;
+}
+
+Eigen::Vector3d SlerpVec(Eigen::Vector3d vec_f,
+	Eigen::Vector3d vec_t,
+	Eigen::Vector3d rotated_vec,
+	double ang)
+{
+	ang = ang / 180 * PI;
+
+	Eigen::Vector3d r = rotated_vec.normalized();
+	if (isnan(r.x()) || isnan(r.y()) || isnan(r.z()))
+	{
+		return vec_f;
+	}
+
+	Eigen::Vector3d res = (cos(ang) * vec_f + (1 - cos(ang)) * (vec_f.dot(r)) * r + sin(ang) * (r.cross(vec_f))).normalized();
+	if (isnan(res.x()) || isnan(res.y()) || isnan(res.z()))
+	{
+		return vec_f;
+	}
+
+	return res;
+}
+
+int ReadMesh(MeshInfo& Mesh,
+	std::string path,
+	TimeInfo& tInfo)
+{
+	// init
+	Mesh.mesh = MyMesh();
+	Mesh.mesh.request_vertex_normals();
+	OpenMesh::IO::Options opt;
+	CGAL::Timer time;
+	time.start();
+
+	// read mesh
+	if (path.length() < 4)
+	{
+		return FILEPATHERROR;
+	}
+	string back = path.substr(path.length() - 3, path.length());
+	if (back != "obj" && back != "stl" && back != "off")
+	{
+		return FILETYPEERROR;
+	}
+	if (!OpenMesh::IO::read_mesh(Mesh.mesh, path, opt))
+	{
+		return READFAILED;
+	}
+	Mesh.mesh.request_face_normals();
+	Mesh.mesh.update_normals();
+	Mesh.mesh.release_face_normals();
+
+	tInfo.t_read += time.time();
+
+	// DEBUG
+	if (DEBUG_MODE)
+	{
+		saveMyMesh(Mesh, "..//data//0_Input_Mesh.obj");
+	}
+
+	return READSUCCESS;
+}
+
+int NormalizeMesh(MeshInfo& Mesh,
+	TimeInfo& tInfo)
+{
+	CGAL::Timer time;
+	time.start();
+
+	if (Mesh.mesh.n_vertices() < 3 || Mesh.mesh.n_faces() == 0)
+	{
+		return NORMALIZEFAILED;
+	}
+
+	float xmax = -MAX;
+	float xmin = MAX;
+	float ymax = -MAX;
+	float ymin = MAX;
+	float zmax = -MAX;
+	float zmin = MAX;
+
+	for (MyMesh::VertexIter v_it = Mesh.mesh.vertices_begin(); v_it != Mesh.mesh.vertices_end(); v_it++)
+	{
+		MyMesh::Point p = Mesh.mesh.point(*v_it);
+		xmax = max(xmax, p[0]);
+		xmin = min(xmin, p[0]);
+		ymax = max(ymax, p[1]);
+		ymin = min(ymin, p[1]);
+		zmax = max(zmax, p[2]);
+		zmin = min(zmin, p[2]);
+	}
+
+	Eigen::Vector3d center(0.5 * (xmax + xmin), 0.5 * (ymax + ymin), 0.5 * (zmax + zmin));
+	double scale = max({ xmax - xmin, ymax - ymin, zmax - zmin });
+
+	ofstream normalize_out("..//data//Normalized_Mesh.obj");
+	for (MyMesh::VertexIter v_it = Mesh.mesh.vertices_begin(); v_it != Mesh.mesh.vertices_end(); v_it++)
+	{
+		MyMesh::Point p = Mesh.mesh.point(*v_it);
+		Eigen::Vector3d vp(p[0], p[1], p[2]);
+		Eigen::Vector3d newp = (vp - center) / scale;
+		normalize_out << "v" << " " << newp[0] << " " << newp[1] << " " << newp[2] << endl;
+	}
+	for (MyMesh::FaceIter f_it = Mesh.mesh.faces_begin(); f_it != Mesh.mesh.faces_end(); f_it++)
+	{
+		MyMesh::FaceHandle fh = (*f_it);
+
+		normalize_out << "f";
+		for (MyMesh::FaceVertexIter fv_it = Mesh.mesh.fv_iter(fh); fv_it.is_valid(); ++fv_it)
+		{
+			normalize_out << " " << (*fv_it).idx() + 1;
+		}
+		normalize_out << endl;
+	}
+	normalize_out.close();
+
+	tInfo.t_normalize += time.time();
+
+	if (ReadMesh(Mesh, "..//data//Normalized_Mesh.obj", tInfo) != READSUCCESS)
+	{
+		return READFAILED;
+	}
+
+	remove("..//data//Normalized_Mesh.obj");
+
+	return NORMALIZESUCCESS;
+}
+
+int SamescaleMesh(MeshInfo& tar_Mesh,
+	MeshInfo& Mesh,
+	TimeInfo& tInfo)
+{
+	CGAL::Timer time;
+	time.start();
+
+	if (tar_Mesh.mesh.n_vertices() < 3 || tar_Mesh.mesh.n_faces() == 0)
+	{
+		return NORMALIZEFAILED;
+	}
+
+	float xmax = -MAX;
+	float xmin = MAX;
+	float ymax = -MAX;
+	float ymin = MAX;
+	float zmax = -MAX;
+	float zmin = MAX;
+
+	for (MyMesh::VertexIter v_it = tar_Mesh.mesh.vertices_begin(); v_it != tar_Mesh.mesh.vertices_end(); v_it++)
+	{
+		MyMesh::Point p = tar_Mesh.mesh.point(*v_it);
+		xmax = max(xmax, p[0]);
+		xmin = min(xmin, p[0]);
+		ymax = max(ymax, p[1]);
+		ymin = min(ymin, p[1]);
+		zmax = max(zmax, p[2]);
+		zmin = min(zmin, p[2]);
+	}
+
+	Eigen::Vector3d center(0.5 * (xmax + xmin), 0.5 * (ymax + ymin), 0.5 * (zmax + zmin));
+	double scale = max({ xmax - xmin, ymax - ymin, zmax - zmin });
+
+	ofstream scale_out("..//data//Scaled_Mesh.obj");
+	for (MyMesh::VertexIter v_it = Mesh.mesh.vertices_begin(); v_it != Mesh.mesh.vertices_end(); v_it++)
+	{
+		MyMesh::Point p = Mesh.mesh.point(*v_it);
+		Eigen::Vector3d vp(p[0], p[1], p[2]);
+		Eigen::Vector3d newp = vp * scale + center;
+		scale_out << "v" << " " << newp[0] << " " << newp[1] << " " << newp[2] << endl;
+	}
+	for (MyMesh::FaceIter f_it = Mesh.mesh.faces_begin(); f_it != Mesh.mesh.faces_end(); f_it++)
+	{
+		MyMesh::FaceHandle fh = (*f_it);
+
+		scale_out << "f";
+		for (MyMesh::FaceVertexIter fv_it = Mesh.mesh.fv_iter(fh); fv_it.is_valid(); ++fv_it)
+		{
+			scale_out << " " << (*fv_it).idx() + 1;
+		}
+		scale_out << endl;
+	}
+	scale_out.close();
+
+	//tInfo.t_normalize += time.time();
+
+	if (ReadMesh(Mesh, "..//data//Scaled_Mesh.obj", tInfo) != READSUCCESS)
+	{
+		return READFAILED;
+	}
+
+	remove("..//data//Scaled_Mesh.obj");
+
+	return NORMALIZESUCCESS;
+}
+
+int Preprocess(MeshInfo& Mesh,
+	double limit,
+	double agress,
+	TimeInfo& tInfo)
+{
+	// init
+	MyMesh mesh = Mesh.mesh;
+	if (limit < 0 || limit > 1)
+	{
+		return PREPROCESSPARAERROR;
+	}
+
+	// load
+	Simplify::vertices.clear();
+	Simplify::triangles.clear();
+	for (int i = 0; i < mesh.n_vertices(); i++)
+	{
+		MyMesh::Point p = mesh.point(mesh.vertex_handle(i));
+
+		Simplify::Vertex v;
+		v.p.x = p[0];
+		v.p.y = p[1];
+		v.p.z = p[2];
+
+		Simplify::vertices.push_back(v);
+	}
+	for (MyMesh::FaceIter f_it = mesh.faces_begin(); f_it != mesh.faces_end(); f_it++)
+	{
+		Simplify::Triangle t;
+		
+		MyMesh::FaceVertexIter fv_it = mesh.fv_begin(*f_it); 
+		t.v[0] = (*fv_it++).idx();
+		t.v[1] = (*(fv_it++)).idx();
+		t.v[2] = (*(fv_it)).idx();
+		t.attr = 0;
+		t.material = -1;
+
+		Simplify::triangles.push_back(t);
+	}
+
+	// simplify
+	CGAL::Timer time;
+	time.start();
+	int target_face_num = Simplify::triangles.size() >> 1;
+	target_face_num = round((double)Simplify::triangles.size() * limit);
+	if (target_face_num > 0 && target_face_num < 3)
+	{
+		return PREPROCESSOUTERROR;
+	}
+	if (limit < 1)
+	{
+		Simplify::simplify_mesh(target_face_num, agress, true);
+	}
+
+	// init info
+	Simplify::write_obj("..//data//1_Preprocessd_Mesh.obj");
+	Mesh.mesh = MyMesh();
+	Mesh.mesh.request_vertex_normals();
+	OpenMesh::IO::Options opt;
+	OpenMesh::IO::read_mesh(Mesh.mesh, "..//data//1_Preprocessd_Mesh.obj", opt);
+	Mesh.mesh.request_face_normals();
+	Mesh.mesh.update_normals();
+	Mesh.mesh.release_face_normals();
+	// calculate OBB bounding box
+	Surface_mesh sm;
+	std::array<Kernel::Point_3, 8> obb_points;
+	CGAL::Polygon_mesh_processing::IO::read_polygon_mesh("..//data//1_Preprocessd_Mesh.obj", sm);
+	CGAL::oriented_bounding_box(sm, obb_points, CGAL::parameters::use_convex_hull(true));
+	double obb_l = sqrt((obb_points[0] - obb_points[1]).squared_length());
+	double obb_w = sqrt((obb_points[0] - obb_points[5]).squared_length());
+	double obb_h = sqrt((obb_points[0] - obb_points[3]).squared_length());
+	Mesh.obbdiag = sqrt(pow(obb_l, 2) + pow(obb_w, 2) + pow(obb_h, 2));
+	// init AABB tree
+	CGAL::IO::read_OBJ("..//data//1_Preprocessd_Mesh.obj", Mesh.polyhedron);
+	Mesh.tree = AABB_Tree(faces(Mesh.polyhedron).first, faces(Mesh.polyhedron).second, Mesh.polyhedron);
+
+	// done
+	tInfo.t_preprocess += time.time();
+
+	// DEBUG
+	if (!DEBUG_MODE)
+	{
+		remove("..//data//1_Preprocessd_Mesh.obj");
+	}
+
+	return PREPROCESSSUCCESS;
+}
+
+int SimplifyMesh(std::vector<Eigen::Vector3d>& points,
+	std::vector<Eigen::Vector3i>& faces,
+	double limit,
+	double agress,
+	TimeInfo& tInfo)
+{
+	// init
+	if (limit < 0 || limit > 1)
+	{
+		return PREPROCESSPARAERROR;
+	}
+
+	// load
+	Simplify::vertices.clear();
+	Simplify::triangles.clear();
+	for (int i = 0; i < points.size(); i++)
+	{
+		Simplify::Vertex v;
+		v.p.x = points[i].x();
+		v.p.y = points[i].y();
+		v.p.z = points[i].z();
+
+		Simplify::vertices.push_back(v);
+	}
+	for (int i = 0; i < faces.size(); i++)
+	{
+		Simplify::Triangle t;
+		t.v[0] = faces[i].x();
+		t.v[1] = faces[i].y();
+		t.v[2] = faces[i].z();
+		t.attr = 0;
+		t.material = -1;
+
+		Simplify::triangles.push_back(t);
+	}
+
+	// simplify
+	CGAL::Timer time;
+	time.start();
+	int target_face_num = Simplify::triangles.size() >> 1;
+	target_face_num = round((double)Simplify::triangles.size() * limit);
+	if (target_face_num > 0 && target_face_num < 3)
+	{
+		return PREPROCESSOUTERROR;
+	}
+	if (limit < 1)
+	{
+		Simplify::simplify_mesh(target_face_num, agress, true);
+	}
+
+	// done
+	tInfo.t_preprocess += time.time();
+
+	// init info
+	Simplify::write_obj("..//data//1_Preprocessd_Mesh.obj");
+	/*Mesh.mesh = MyMesh();
+	Mesh.mesh.request_vertex_normals();
+	OpenMesh::IO::Options opt;
+	OpenMesh::IO::read_mesh(Mesh.mesh, "..//data//1_Preprocessd_Mesh.obj", opt);
+	Mesh.mesh.request_face_normals();
+	Mesh.mesh.update_normals();
+	Mesh.mesh.release_face_normals();
+	// calculate OBB bounding box
+	Surface_mesh sm;
+	std::array<Kernel::Point_3, 8> obb_points;
+	CGAL::Polygon_mesh_processing::IO::read_polygon_mesh("..//data//1_Preprocessd_Mesh.obj", sm);
+	CGAL::oriented_bounding_box(sm, obb_points, CGAL::parameters::use_convex_hull(true));
+	double obb_l = sqrt((obb_points[0] - obb_points[1]).squared_length());
+	double obb_w = sqrt((obb_points[0] - obb_points[5]).squared_length());
+	double obb_h = sqrt((obb_points[0] - obb_points[3]).squared_length());
+	Mesh.obbdiag = sqrt(pow(obb_l, 2) + pow(obb_w, 2) + pow(obb_h, 2));
+	// init AABB tree
+	CGAL::IO::read_OBJ("..//data//1_Preprocessd_Mesh.obj", Mesh.polyhedron);
+	Mesh.tree = AABB_Tree(faces(Mesh.polyhedron).first, faces(Mesh.polyhedron).second, Mesh.polyhedron);*/
+
+	readOBJ("..//data//1_Preprocessd_Mesh.obj", points, faces);
+
+	// DEBUG
+	if (!DEBUG_MODE)
+	{
+		remove("..//data//1_Preprocessd_Mesh.obj");
+	}
+
+	return PREPROCESSSUCCESS;
+}
+
+int SimplifyMesh2(MeshInfo& Mesh,
+	double limit,
+	TimeInfo& tInfo)
+{
+	// init
+	MyMesh mesh = Mesh.mesh;
+
+	// load
+	Simplify::vertices.clear();
+	Simplify::triangles.clear();
+	for (int i = 0; i < mesh.n_vertices(); i++)
+	{
+		MyMesh::Point p = mesh.point(mesh.vertex_handle(i));
+
+		Simplify::Vertex v;
+		v.p.x = p[0];
+		v.p.y = p[1];
+		v.p.z = p[2];
+
+		Simplify::vertices.push_back(v);
+	}
+	for (MyMesh::FaceIter f_it = mesh.faces_begin(); f_it != mesh.faces_end(); f_it++)
+	{
+		Simplify::Triangle t;
+
+		MyMesh::FaceVertexIter fv_it = mesh.fv_begin(*f_it);
+		t.v[0] = (*fv_it++).idx();
+		t.v[1] = (*(fv_it++)).idx();
+		t.v[2] = (*(fv_it)).idx();
+		t.attr = 0;
+		t.material = -1;
+
+		Simplify::triangles.push_back(t);
+	}
+
+	// simplify
+	CGAL::Timer time;
+	time.start();
+	int target_face_num = Simplify::triangles.size() >> 1;
+	target_face_num = round((double)Simplify::triangles.size() * limit);
+	Simplify::simplify_mesh_lossless(target_face_num, false);
+
+	// done
+	tInfo.t_preprocess += time.time();
+
+	// init info
+	Simplify::write_obj("..//data//1_Preprocessd_Mesh.obj");
+	Mesh.mesh = MyMesh();
+	Mesh.mesh.request_vertex_normals();
+	OpenMesh::IO::Options opt;
+	OpenMesh::IO::read_mesh(Mesh.mesh, "..//data//1_Preprocessd_Mesh.obj", opt);
+	Mesh.mesh.request_face_normals();
+	Mesh.mesh.update_normals();
+	Mesh.mesh.release_face_normals();
+
+	if (!DEBUG_MODE)
+	{
+		remove("..//data//1_Preprocessd_Mesh.obj");
+	}
+}
+
+int OffsetPointGeneration(MeshInfo& Mesh,
+	std::vector<MyPoint>& offset_points,
+	double offset,
+	double sample_par,
+	double edge_sample_par,
+	double face_sample_par,
+	TimeInfo& tInfo)
+{
+	bool isOffsetEdge = true;
+	bool isOffsetPoint = true;
+	bool isOffsetFace = true;
+
+	// init
+	CGAL::Timer time;
+	time.start();
+	int numProcs = omp_get_num_procs();
+	omp_set_num_threads(2 * numProcs - 1);
+	MyMesh mesh = Mesh.mesh;
+	offset_points.clear();
+	double sample_dis = sample_par * Mesh.obbdiag;
+	Mesh.sampledis = sample_dis;
+	double sample_angle;
+	if (offset == 0)
+	{
+		sample_angle = 360;
+	}
+	else
+	{
+		sample_angle = 2 * safetyAsin(sample_dis * edge_sample_par / 2 / abs(offset));
+	}
+	if (sample_dis < 0 || sample_angle < 0 || mesh.n_faces() == 0 || mesh.n_vertices() == 0)
+	{
+		return OFFSETMESHERROR;
+	}
+
+
+	// init boundary index
+	vector<int> BoundaryIndex(mesh.n_halfedges(), -1);
+	int b_index = 0;
+	for (MyMesh::HalfedgeIter h_it = mesh.halfedges_begin(); h_it != mesh.halfedges_end(); h_it++)
+	{
+		if (!(*h_it).is_boundary() || BoundaryIndex[(*h_it).idx()] != -1)
+		{
+			continue;
+		}
+
+		MyMesh::HalfedgeHandle h_h = (*h_it);
+		while (true)
+		{
+			BoundaryIndex[h_h.idx()] = b_index;
+			h_h = mesh.next_halfedge_handle(h_h);
+			if (h_h.idx() == (*h_it).idx())
+			{
+				b_index++;
+				break;
+			}
+		}
+	}
+	Mesh.bloopnum = b_index;
+
+	// init face normals
+	vector<Eigen::Vector3d> FacesNormal(mesh.n_faces());
+#pragma omp parallel for
+	for (int i = 0; i < mesh.n_faces(); i++)
+	{
+		MyMesh::FaceHandle fh = mesh.face_handle(i);
+		vector<MyMesh::Normal> fh_array;
+		for (MyMesh::FaceHalfedgeIter fh_it = mesh.fh_begin(fh); fh_it != mesh.fh_end(fh); fh_it++)
+		{
+			MyMesh::HalfedgeHandle hh = (*fh_it);
+			MyMesh::Normal fh_v = mesh.point(mesh.to_vertex_handle(hh)) - mesh.point(mesh.from_vertex_handle(hh));
+			fh_array.push_back(fh_v);
+		}
+		if (fh_array.size() != 3) continue;
+
+		MyMesh::Normal normal_face = SIGN(offset) * ((fh_array[0] % fh_array[1])).normalized();
+		if (isnan(normal_face[0]) || isnan(normal_face[1]) || isnan(normal_face[2]))
+		{
+			normal_face = { 0, 0, 0 };
+		}
+
+		FacesNormal[i] = Eigen::Vector3d(normal_face[0], normal_face[1], normal_face[2]);
+	}
+
+	// init vertex normals
+	vector<Eigen::Vector3d> VerticesNormal(mesh.n_vertices());
+#pragma omp parallel for
+	for (int i = 0; i < mesh.n_vertices(); i++)
+	{
+		vector<Eigen::Vector3d> ring_normals;
+		vector<int> clusters;
+
+		MyMesh::VertexHandle it = mesh.vertex_handle(i);
+		MyMesh::Normal normal_point = { 0, 0, 0 };
+		for (MyMesh::VertexIHalfedgeIter vih_it = mesh.vih_iter(it); vih_it.is_valid(); vih_it++)
+		{
+			MyMesh::HalfedgeHandle heh = (*vih_it);
+			MyMesh::HalfedgeHandle heh_ne = mesh.next_halfedge_handle(*vih_it);
+			MyMesh::Normal heh_vec = mesh.point(mesh.to_vertex_handle(heh)) - mesh.point(mesh.from_vertex_handle(heh));
+			MyMesh::Normal heh_ne_vec = mesh.point(mesh.to_vertex_handle(heh_ne)) - mesh.point(mesh.from_vertex_handle(heh_ne));
+
+			if (!mesh.is_boundary(heh))
+			{
+				//MyMesh::Normal cross_normal = (heh_vec % heh_ne_vec).normalized();
+				//normal_point = normal_point + cross_normal; // average
+
+				//ring_normals.push_back(Eigen::Vector3d(cross_normal[0], cross_normal[1], cross_normal[2]));
+				ring_normals.push_back(FacesNormal[mesh.face_handle(heh).idx()]);
+			}
+		}
+
+		GaussMapCluster(ring_normals, 1, clusters);
+		for (int j = 0; j < clusters.size(); j++)
+		{
+			if (clusters[j] == j)
+			{
+				normal_point = normal_point + MyMesh::Normal(ring_normals[j].x(), ring_normals[j].y(), ring_normals[j].z()) ;
+			}
+		}
+
+		// normal_point = SIGN(offset) * normal_point.normalized();
+		normal_point = normal_point.normalized();
+		if (isnan(normal_point[0]) || isnan(normal_point[1]) || isnan(normal_point[2]))
+		{
+			normal_point = { 0, 0, 0 };
+		}
+		
+		VerticesNormal[i] = Eigen::Vector3d(normal_point[0], normal_point[1], normal_point[2]);
+	}
+
+
+	// offset edge and vertex
+	// init openmp vector
+	vector<vector<MyPoint>> offset_points_openmp;
+	for (int i = 0; i < mesh.n_vertices(); i++)
+	{
+		vector<MyPoint> tmp_openmp;
+		offset_points_openmp.push_back(tmp_openmp);
+	}
+#pragma omp parallel for
+	for (int v_index = 0; v_index < mesh.n_vertices(); v_index++)
+	{
+		MyMesh::VertexHandle it_h = mesh.vertex_handle(v_index);
+
+		MyMesh::Point point = mesh.point(it_h);
+		vector<MyMesh::Normal> generate_normal_array;
+		vector<MyMesh::Normal> normal_face_array;
+		vector<MyMesh::Normal> normal_face_op_array;
+		vector<MyMesh::HalfedgeHandle> heh_direction_array;
+
+		MyMesh::Normal normal_point(VerticesNormal[it_h.idx()][0], VerticesNormal[it_h.idx()][1], VerticesNormal[it_h.idx()][2]);
+
+
+		// minimum/maximum adjacent edge length
+		double max_edge_length = -1;
+		double min_edge_length = MAX;
+		for (MyMesh::VertexIHalfedgeIter vih_it = mesh.vih_iter(it_h); vih_it.is_valid(); vih_it++)
+		{
+			double edge_length = (mesh.point(mesh.to_vertex_handle(*vih_it)) - mesh.point(mesh.from_vertex_handle(*vih_it))).length();
+			max_edge_length = (edge_length > max_edge_length) ? edge_length : max_edge_length;
+			min_edge_length = (edge_length < min_edge_length) ? edge_length : min_edge_length;
+		}
+		if (max_edge_length < 0 || min_edge_length >= MAX) continue;
+
+
+		// traverse adjacent halfedge
+		for (MyMesh::VertexIHalfedgeIter vih_it = mesh.vih_iter(it_h); vih_it.is_valid(); vih_it++)
+		{
+			MyMesh::HalfedgeHandle heh = (*vih_it);
+			MyMesh::HalfedgeHandle heh_op = mesh.opposite_halfedge_handle(*vih_it);
+			MyMesh::HalfedgeHandle heh_ne = mesh.next_halfedge_handle(*vih_it);
+			MyMesh::HalfedgeHandle heh_nene = mesh.next_halfedge_handle(heh_ne);
+			MyMesh::HalfedgeHandle heh_oppr = mesh.prev_halfedge_handle(heh_op);
+			MyMesh::HalfedgeHandle heh_opne = mesh.next_halfedge_handle(heh_op);
+			MyMesh::Normal heh_vec = mesh.point(mesh.to_vertex_handle(heh)) - mesh.point(mesh.from_vertex_handle(heh));
+			MyMesh::Normal heh_op_vec = mesh.point(mesh.to_vertex_handle(heh_op)) - mesh.point(mesh.from_vertex_handle(heh_op));
+			MyMesh::Normal heh_ne_vec = mesh.point(mesh.to_vertex_handle(heh_ne)) - mesh.point(mesh.from_vertex_handle(heh_ne));
+			MyMesh::Normal heh_nene_vec = mesh.point(mesh.to_vertex_handle(heh_nene)) - mesh.point(mesh.from_vertex_handle(heh_nene));
+			MyMesh::Normal heh_oppr_vec = mesh.point(mesh.to_vertex_handle(heh_oppr)) - mesh.point(mesh.from_vertex_handle(heh_oppr));
+			MyMesh::Normal heh_opne_vec = mesh.point(mesh.to_vertex_handle(heh_opne)) - mesh.point(mesh.from_vertex_handle(heh_opne));
+			MyMesh::Normal normal_face = { 0, 0, 0 };
+			MyMesh::Normal normal_face_op = { 0, 0, 0 };
+			if (!mesh.is_boundary(heh))
+			{
+				normal_face = MyMesh::Normal(FacesNormal[mesh.face_handle(heh).idx()][0], FacesNormal[mesh.face_handle(heh).idx()][1], FacesNormal[mesh.face_handle(heh).idx()][2]);
+			}
+			if (!mesh.is_boundary(heh_op))
+			{
+				normal_face_op = MyMesh::Normal(FacesNormal[mesh.face_handle(heh_op).idx()][0], FacesNormal[mesh.face_handle(heh_op).idx()][1], FacesNormal[mesh.face_handle(heh_op).idx()][2]);
+			}
+
+			MyMesh::Normal normal_edge = { 0, 0, 0 };
+			normal_edge = (normal_face + normal_face_op).normalized();
+			if (isnan(normal_edge[0]) || isnan(normal_edge[1]) || isnan(normal_edge[2]))
+			{
+				normal_edge = { 0, 0, 0 };
+			}
+
+			// generate edge's multiple normal
+			vector<MyMesh::Normal> generate_edge_normal_array;
+			if (normal_face.length() > EPS && normal_face_op.length() > EPS)
+			{
+				double rot_angle = safetyAcos(normal_face | normal_face_op);
+				double inter_num = round(rot_angle / sample_angle);
+				if (inter_num < 3) inter_num = 3;
+				double inter_angle_space_cur = rot_angle / double(inter_num);
+
+				// determine whether sampling is required
+				MyMesh::Normal normal_crossproduct = normal_face % normal_face_op;
+				if (rot_angle < 179 && !isnan(normal_crossproduct[0]) && !isnan(normal_crossproduct[1]) && !isnan(normal_crossproduct[2]))
+				{
+					if ((normal_crossproduct | heh_vec) > 0)
+					{
+						if (offset < 0)
+						{
+							continue;
+						}
+					}
+					else if ((normal_crossproduct | heh_vec) < 0)
+					{
+						if (offset > 0)
+						{
+							continue;
+						}
+					}
+					else
+					{
+						continue;
+					}
+				}
+
+				// if the arc length is too small, the sample will not be taken
+				if (((offset * normal_face) - (offset * normal_face_op)).length() >= sample_dis)
+				{
+					if (rot_angle >= inter_angle_space_cur)
+					{
+						generate_edge_normal_array.push_back(normal_face);
+					}
+
+					for (double ang_tmp = inter_angle_space_cur; ang_tmp < rot_angle; ang_tmp += inter_angle_space_cur)
+					{
+						generate_edge_normal_array.push_back(Slerp(normal_face, normal_face_op, SIGN(offset) * heh_vec, ang_tmp));
+					}
+
+					if (rot_angle >= inter_angle_space_cur)
+					{
+						generate_edge_normal_array.push_back(normal_face_op);
+					}
+				}
+				else
+				{
+					generate_edge_normal_array.push_back(normal_edge);
+				}
+			}
+			else
+			{
+				if (normal_face.length() > EPS)
+				{
+					generate_edge_normal_array.push_back(normal_face);
+				}
+				if (normal_face_op.length() > EPS)
+				{
+					generate_edge_normal_array.push_back(normal_face_op);
+				}
+			}
+
+			generate_normal_array.insert(generate_normal_array.end(), generate_edge_normal_array.begin(), generate_edge_normal_array.end());
+
+			normal_face_array.push_back(normal_face);
+			normal_face_op_array.push_back(normal_face_op);
+			heh_direction_array.push_back(heh);
+
+			// sample edge
+			if (isOffsetEdge)
+			{
+				double sample_num = round(0.5 * heh_vec.length() / sample_dis);
+				if (sample_num < 1) sample_num = 1;
+				double edge_space = 0.5 * heh_vec.length() / double(sample_num) * edge_sample_par;
+				if (edge_space <= 0) continue;
+
+				// boundary edge sampling setting
+				if (mesh.is_boundary(it_h)) edge_space /= 4;
+
+				double interlace = 0.5;
+				for (size_t i = 0; i < generate_edge_normal_array.size(); i++)
+				{
+					MyMesh::Point tmpP = point + generate_edge_normal_array[i] * abs(offset);
+
+					MyPoint offset_point;
+					offset_point.cor = Eigen::Vector3d(tmpP[0], tmpP[1], tmpP[2]);
+					offset_point.nor = Eigen::Vector3d(generate_edge_normal_array[i][0], generate_edge_normal_array[i][1], generate_edge_normal_array[i][2]);
+					offset_point.OriginIndex = make_pair(1, heh.idx());
+
+					if (mesh.is_boundary(heh))
+					{
+						offset_point.IsBoundary = true;
+						offset_point.BoundaryIndex = BoundaryIndex[heh.idx()];
+					}
+					else if (mesh.is_boundary(heh_op))
+					{
+						offset_point.IsBoundary = true;
+						offset_point.BoundaryIndex = BoundaryIndex[heh_op.idx()];
+					}
+
+					offset_points_openmp[v_index].push_back(offset_point);
+
+					for (double space_tmp = interlace * edge_space; space_tmp <= 0.5 * heh_vec.length(); space_tmp += edge_space)
+					{
+						MyMesh::Point tmpP2 = point - space_tmp * heh_vec.normalized() + generate_edge_normal_array[i] * abs(offset);
+
+						MyPoint offset_point2;
+						offset_point2.cor = Eigen::Vector3d(tmpP2[0], tmpP2[1], tmpP2[2]);
+						offset_point2.nor = Eigen::Vector3d(generate_edge_normal_array[i][0], generate_edge_normal_array[i][1], generate_edge_normal_array[i][2]);
+						offset_point.OriginIndex = make_pair(1, heh.idx());
+
+						if (mesh.is_boundary(heh))
+						{
+							offset_point2.IsBoundary = true;
+							offset_point2.BoundaryIndex = BoundaryIndex[heh.idx()];
+						}
+						else if (mesh.is_boundary(heh_op))
+						{
+							offset_point2.IsBoundary = true;
+							offset_point2.BoundaryIndex = BoundaryIndex[heh_op.idx()];
+						}
+
+						offset_points_openmp[v_index].push_back(offset_point2);
+					}
+
+					if (interlace == 0.5) interlace = 1;
+					else if (interlace == 1) interlace = 0.5;
+				}
+			}
+		}
+
+
+		// sample vertex
+		if (isOffsetPoint)
+		{
+			double point_inter_par = 1;
+			for (size_t i = 0; i < normal_face_array.size(); i++)
+			{
+				MyMesh::Normal normal_face = normal_face_array[i];
+				MyMesh::Normal normal_face_op = normal_face_op_array[i];
+				if (((offset * normal_face) - (offset * normal_face_op)).length() < sample_dis) continue;
+
+				if (normal_face.length() > EPS && normal_face_op.length() > EPS)
+				{
+					double rot_point_normal = safetyAcos(normal_point | normal_face);
+					double rot_point_normal_op = safetyAcos(normal_point | normal_face_op);
+					double sample_point_normal = round(rot_point_normal / sample_angle * point_inter_par);
+					double sample_point_normal_op = round(rot_point_normal_op / sample_angle * point_inter_par);
+					if (sample_point_normal < 1) sample_point_normal = 1;
+					if (sample_point_normal_op < 1) sample_point_normal_op = 1;
+					double inter_angle_point_normal = rot_point_normal / sample_point_normal;
+					double inter_angle_point_normal_op = rot_point_normal_op / sample_point_normal_op;
+
+					MyMesh::Normal npXnf = normal_point % normal_face;
+					MyMesh::Normal npXnfop = normal_point % normal_face_op;
+					while (rot_point_normal > 0 && rot_point_normal_op > 0)
+					{
+						MyMesh::Normal cur_normal_face = Slerp(normal_point, normal_face, npXnf, rot_point_normal);
+						MyMesh::Normal cur_normal_face_op = Slerp(normal_point, normal_face_op, npXnfop, rot_point_normal_op);
+
+						double cur_rot_angle = safetyAcos(cur_normal_face | cur_normal_face_op);
+						int cur_sample_num = cur_rot_angle / sample_angle * point_inter_par;
+						double cur_inter_angle_space = cur_rot_angle / double(cur_sample_num);
+
+						MyMesh::Normal cfXcfop = cur_normal_face % cur_normal_face_op;
+						for (double ang_tmp = 0.5 * cur_inter_angle_space; ang_tmp < cur_rot_angle; ang_tmp += cur_inter_angle_space)
+						{
+							MyMesh::Normal normal_tmp = Slerp(cur_normal_face, cur_normal_face_op, cfXcfop, ang_tmp);
+
+							MyMesh::Point tmpP = point + normal_tmp * abs(offset);
+							MyPoint offset_point;
+							offset_point.cor = Eigen::Vector3d(tmpP[0], tmpP[1], tmpP[2]);
+							offset_point.nor = Eigen::Vector3d(normal_tmp[0], normal_tmp[1], normal_tmp[2]);
+							offset_point.OriginIndex = make_pair(0, v_index);
+
+							offset_points_openmp[v_index].push_back(offset_point);
+						}
+
+						rot_point_normal -= inter_angle_point_normal;
+						rot_point_normal_op -= inter_angle_point_normal_op;
+					}
+				}
+				else if (normal_face.length() > EPS)
+				{
+					double cur_rot_angle = safetyAcos(normal_face | normal_point);
+					double cur_inter_angle_space = 0.5 * sample_angle * point_inter_par;
+
+					MyMesh::Normal nfXnp = normal_face % normal_point;
+					for (double ang_tmp = 0.5 * cur_inter_angle_space; ang_tmp < cur_rot_angle; ang_tmp += cur_inter_angle_space)
+					{
+						MyMesh::Normal normal_tmp = Slerp(normal_face, normal_point, nfXnp, ang_tmp);
+
+						MyMesh::Point tmpP = point + normal_tmp * abs(offset);
+						MyPoint offset_point;
+						offset_point.cor = Eigen::Vector3d(tmpP[0], tmpP[1], tmpP[2]);
+						offset_point.nor = Eigen::Vector3d(normal_tmp[0], normal_tmp[1], normal_tmp[2]);
+						offset_point.OriginIndex = make_pair(0, v_index);
+						offset_point.IsBoundary = true;
+						offset_point.BoundaryIndex = BoundaryIndex[mesh.opposite_halfedge_handle(heh_direction_array[i]).idx()];
+
+						offset_points_openmp[v_index].push_back(offset_point);
+					}
+				}
+				else if (normal_face_op.length() > EPS)
+				{
+					double cur_rot_angle = safetyAcos(normal_face_op | normal_point);
+					double cur_inter_angle_space = 0.5 * sample_angle * point_inter_par;
+
+					MyMesh::Normal nfopXnp = normal_face_op % normal_point;
+					for (double ang_tmp = 0.5 * cur_inter_angle_space; ang_tmp < cur_rot_angle; ang_tmp += cur_inter_angle_space)
+					{
+						MyMesh::Normal normal_tmp = Slerp(normal_face_op, normal_point, nfopXnp, ang_tmp);
+
+						MyMesh::Point tmpP = point + normal_tmp * abs(offset);
+						MyPoint offset_point;
+						offset_point.cor = Eigen::Vector3d(tmpP[0], tmpP[1], tmpP[2]);
+						offset_point.nor = Eigen::Vector3d(normal_tmp[0], normal_tmp[1], normal_tmp[2]);
+						offset_point.OriginIndex = make_pair(0, v_index);
+						offset_point.IsBoundary = true;
+						offset_point.BoundaryIndex = BoundaryIndex[heh_direction_array[i].idx()];
+
+						offset_points_openmp[v_index].push_back(offset_point);
+					}
+				}
+			}
+		}
+	}
+	// convert openmp
+	for (int i = 0; i < offset_points_openmp.size(); i++)
+	{
+		offset_points.insert(offset_points.end(), offset_points_openmp[i].begin(), offset_points_openmp[i].end());
+	}
+
+	// offset face
+	if (isOffsetFace)
+	{
+		vector<Utils_sampling::Vec3> verts_vec3;
+		vector<Utils_sampling::Vec3> nors_vec3;
+
+		vector<int> tris;
+		vector<MyMesh::Point> samples_pos;
+		vector<MyMesh::Normal> samples_nor;
+		int point_cnt = 0;
+		for (MyMesh::FaceIter f_it = mesh.faces_begin(); f_it != mesh.faces_end(); f_it++)
+		{
+			std::vector<MyMesh::Point> face_points;
+			for (MyMesh::FaceVertexIter fv_it = mesh.fv_begin(*f_it); fv_it != mesh.fv_end(*f_it); fv_it++)
+			{
+				face_points.push_back(mesh.point(*fv_it));
+			}
+
+			MyMesh::Normal vec_normal(FacesNormal[(*f_it).idx()].x(), FacesNormal[(*f_it).idx()].y(), FacesNormal[(*f_it).idx()].z());
+
+			for (size_t i = 0; i < face_points.size(); i++)
+			{
+				Utils_sampling::Vec3 point_vec3 = { face_points[i][0], face_points[i][1], face_points[i][2] };
+				verts_vec3.push_back(point_vec3);
+
+				Utils_sampling::Vec3 normal_vec3 = { vec_normal[0], vec_normal[1], vec_normal[2] };
+				nors_vec3.push_back(normal_vec3);
+				tris.push_back(point_cnt++);
+			}
+		}
+
+		std::vector<Utils_sampling::Vec3> samples_pos_vec3;
+		std::vector<Utils_sampling::Vec3> samples_nor_vec3;
+		Utils_sampling::poisson_disk(sample_dis * face_sample_par, 100, verts_vec3, nors_vec3, tris, samples_pos_vec3, samples_nor_vec3);
+
+		for (size_t i = 0; i < samples_pos_vec3.size(); i++)
+		{
+			MyPoint offset_point;
+			offset_point.cor = Eigen::Vector3d(samples_pos_vec3[i].x, samples_pos_vec3[i].y, samples_pos_vec3[i].z);
+			offset_point.nor = Eigen::Vector3d(samples_nor_vec3[i].x, samples_nor_vec3[i].y, samples_nor_vec3[i].z);
+			offset_point.cor = offset_point.cor + abs(offset) * offset_point.nor;
+			offset_point.OriginIndex = make_pair(2, -1);
+
+			offset_points.push_back(offset_point);
+		}
+	}
+
+
+	// done
+	tInfo.t_offseting += time.time();
+
+
+	// DEBUG
+	if (DEBUG_MODE)
+	{
+		ofstream offset_points_out("..//data//2_Offset_Points.obj");
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			offset_points_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << endl;
+		}
+		offset_points_out.close();
+
+		ofstream offset_boundary_point_out("..//data//2_Offset_Points_Boundary.obj");
+		vector <vector<int>> group_color;
+		for (int i = 0; i < Mesh.bloopnum; i++)
+		{
+			int color_r = (rand() % (255));
+			int color_g = (rand() % (255));
+			int color_b = (rand() % (255));
+			vector<int> group_rgb = { color_r, color_g, color_b };
+			group_color.push_back(group_rgb);
+		}
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsBoundary && offset_points[i].BoundaryIndex != -1)
+			{
+				offset_boundary_point_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << " " 
+					<< group_color[offset_points[i].BoundaryIndex][0] << " " << group_color[offset_points[i].BoundaryIndex][1] << " " << group_color[offset_points[i].BoundaryIndex][2] << endl;
+			}
+		}
+		offset_boundary_point_out.close();
+	}
+
+
+	return OFFSETPOINTSUCCESS;
+}
+
+int HollowOffsetPointGeneration(MeshInfo& Mesh,
+	std::vector<MyPoint>& offset_points,
+	double offset,
+	double sample_par,
+	double edge_sample_par,
+	double face_sample_par,
+	TimeInfo& tInfo)
+{
+	bool isOffsetEdge = true;
+	bool isOffsetPoint = true;
+	bool isOffsetFace = true;
+
+	// init
+	CGAL::Timer time;
+	time.start();
+	int numProcs = omp_get_num_procs();
+	omp_set_num_threads(2 * numProcs - 1);
+	MyMesh mesh = Mesh.mesh;
+	offset_points.clear();
+	double sample_dis = sample_par * Mesh.obbdiag;
+	Mesh.sampledis = sample_dis;
+	double sample_angle;
+	if (offset == 0)
+	{
+		sample_angle = 360;
+	}
+	else
+	{
+		sample_angle = 2 * safetyAsin(sample_dis * edge_sample_par / 2 / abs(offset));
+	}
+	if (sample_dis < 0 || sample_angle < 0 || mesh.n_faces() == 0 || mesh.n_vertices() == 0)
+	{
+		return OFFSETMESHERROR;
+	}
+
+	// init boundary index
+	/*
+	vector<int> BoundaryIndex(mesh.n_halfedges(), -1);
+	int b_index = 0;
+	for (MyMesh::HalfedgeIter h_it = mesh.halfedges_begin(); h_it != mesh.halfedges_end(); h_it++)
+	{
+		if (!(*h_it).is_boundary() || BoundaryIndex[(*h_it).idx()] != -1)
+		{
+			continue;
+		}
+
+		MyMesh::HalfedgeHandle h_h = (*h_it);
+		while (true)
+		{
+			BoundaryIndex[h_h.idx()] = b_index;
+			h_h = mesh.next_halfedge_handle(h_h);
+			if (h_h.idx() == (*h_it).idx())
+			{
+				b_index++;
+				break;
+			}
+		}
+	}
+	Mesh.bloopnum = b_index;*/
+
+	// init face normals
+	vector<Eigen::Vector3d> FacesNormal(mesh.n_faces());
+#pragma omp parallel for
+	for (int i = 0; i < mesh.n_faces(); i++)
+	{
+		MyMesh::FaceHandle fh = mesh.face_handle(i);
+		vector<MyMesh::Normal> fh_array;
+		for (MyMesh::FaceHalfedgeIter fh_it = mesh.fh_begin(fh); fh_it != mesh.fh_end(fh); fh_it++)
+		{
+			MyMesh::HalfedgeHandle hh = (*fh_it);
+			MyMesh::Normal fh_v = mesh.point(mesh.to_vertex_handle(hh)) - mesh.point(mesh.from_vertex_handle(hh));
+			fh_array.push_back(fh_v);
+		}
+		if (fh_array.size() != 3) continue;
+
+		MyMesh::Normal normal_face = SIGN(offset) * ((fh_array[0] % fh_array[1])).normalized();
+		if (isnan(normal_face[0]) || isnan(normal_face[1]) || isnan(normal_face[2]))
+		{
+			normal_face = { 0, 0, 0 };
+		}
+
+		FacesNormal[i] = Eigen::Vector3d(normal_face[0], normal_face[1], normal_face[2]);
+	}
+
+	// init vertex normals
+	vector<Eigen::Vector3d> VerticesNormal(mesh.n_vertices());
+#pragma omp parallel for
+	for (int i = 0; i < mesh.n_vertices(); i++)
+	{
+		MyMesh::VertexHandle it = mesh.vertex_handle(i);
+		MyMesh::Normal normal_point = { 0, 0, 0 };
+		MyMesh::Normal edge_vec = { 0, 0, 0 };
+		MyMesh::Normal edge_ne_vec = { 0, 0, 0 };
+		MyMesh::Normal edge_next_face_normal = { 0, 0, 0 };
+		for (MyMesh::VertexIHalfedgeIter vih_it = mesh.vih_iter(it); vih_it.is_valid(); vih_it++)
+		{
+			MyMesh::HalfedgeHandle heh = (*vih_it);
+			MyMesh::HalfedgeHandle heh_ne = mesh.next_halfedge_handle(*vih_it);
+			MyMesh::Normal heh_vec = mesh.point(mesh.to_vertex_handle(heh)) - mesh.point(mesh.from_vertex_handle(heh));
+			MyMesh::Normal heh_ne_vec = mesh.point(mesh.to_vertex_handle(heh_ne)) - mesh.point(mesh.from_vertex_handle(heh_ne));
+
+			if (!mesh.is_boundary(heh))
+			{
+				MyMesh::Normal tmp_vec = (heh_vec % heh_ne_vec).normalized();
+				normal_point = normal_point + tmp_vec; // average
+			}
+			else
+			{
+				MyMesh::HalfedgeHandle heh_op = mesh.opposite_halfedge_handle(*vih_it);
+				MyMesh::HalfedgeHandle heh_op_ne = mesh.next_halfedge_handle(heh_op);
+				MyMesh::Normal heh_op_vec = mesh.point(mesh.to_vertex_handle(heh_op)) - mesh.point(mesh.from_vertex_handle(heh_op));
+				MyMesh::Normal heh_op_ne_vec = mesh.point(mesh.to_vertex_handle(heh_op_ne)) - mesh.point(mesh.from_vertex_handle(heh_op_ne));
+
+				edge_vec = heh_vec.normalized();
+				edge_ne_vec = heh_ne_vec.normalized();
+				edge_next_face_normal = (heh_op_vec % heh_op_ne_vec).normalized();
+				break;
+			}
+		}
+
+		if (mesh.is_boundary(it))
+		{
+			double angle;
+			MyMesh::Normal edge_cross = edge_vec.cross(edge_ne_vec);
+			if (edge_cross.norm() < EPS)
+			{
+				angle = 90;
+			}
+			else
+			{
+				angle = safetyAcos(edge_vec.normalized().dot(edge_ne_vec.normalized())) / 2;
+				edge_cross.normalize();
+				if (safetyAcos(edge_cross.dot(edge_next_face_normal)) > 90)
+				{
+					angle = 180 - angle;
+				}
+			}
+			normal_point = Slerp(edge_ne_vec, edge_vec, edge_next_face_normal, angle);
+		}
+		else
+		{
+			normal_point = SIGN(offset) * normal_point.normalized();
+		}
+
+		if (isnan(normal_point[0]) || isnan(normal_point[1]) || isnan(normal_point[2]))
+		{
+			normal_point = { 0, 0, 0 };
+		}
+
+		VerticesNormal[i] = Eigen::Vector3d(normal_point[0], normal_point[1], normal_point[2]);
+	}
+
+	// init ball normals
+	vector<MyMesh::Normal> ball_normals_array;
+	double theta_num = round(180 / sample_angle);
+	double theta_space = 180 / theta_num;
+	for (double cur_theta = 0; cur_theta < 180 + EPS; cur_theta += theta_space)
+	{
+		if (sin(ang2rad(cur_theta)) < EPS)
+		{
+			MyMesh::Normal tmp_N = { 0, 0, cos(ang2rad(cur_theta)) };
+			ball_normals_array.push_back(tmp_N.normalized());
+			continue;
+		}
+
+		double cur_circum_radius = offset * sin(ang2rad(cur_theta));
+		double cur_sample_angle = 2 * safetyAsin(sample_dis * edge_sample_par / 2 / cur_circum_radius);
+		double phi_num = round(360 / cur_sample_angle);
+		double phi_space = 360 / phi_num;
+
+		for (double cur_phi = 0; cur_phi < 360; cur_phi += phi_space)
+		{
+			MyMesh::Normal tmp_N = { sin(ang2rad(cur_theta)) * cos(ang2rad(cur_phi)), sin(ang2rad(cur_theta)) * sin(ang2rad(cur_phi)), cos(ang2rad(cur_theta)) };
+			ball_normals_array.push_back(tmp_N.normalized());
+		}
+	}
+
+
+	// debug vertex normal
+	time.stop();
+	if (DEBUG_MODE)
+	{
+		ofstream out_v("..//data//2_OriMesh_Normal.obj");
+		int test_i = 0;
+		for (int i = 0; i < mesh.n_vertices(); i++)
+		{
+			MyMesh::VertexHandle it = mesh.vertex_handle(i);
+			MyMesh::Point p = mesh.point(it);
+			MyMesh::Normal n = { VerticesNormal[i].x(), VerticesNormal[i].y() , VerticesNormal[i].z() };
+			MyMesh::Point p2 = p + abs(offset) * n;
+			out_v << "v" << " " << p[0] << " " << p[1] << " " << p[2] << " " << "252 233 79" << endl;
+			out_v << "v" << " " << p2[0] << " " << p2[1] << " " << p2[2] << " " << "255 255 255" << endl;
+			out_v << "l" << " " << 2 * test_i + 1 << " " << 2 * test_i + 2 << endl;
+			test_i++;
+		}
+		out_v.close();
+	}
+	time.start();
+
+
+	// offset edge and vertex
+	// init openmp vector
+	vector<vector<MyPoint>> offset_points_openmp;
+	for (int i = 0; i < mesh.n_vertices(); i++)
+	{
+		vector<MyPoint> tmp_openmp;
+		offset_points_openmp.push_back(tmp_openmp);
+	}
+#pragma omp parallel for
+	for (int v_index = 0; v_index < mesh.n_vertices(); v_index++)
+	{
+		MyMesh::VertexHandle it_h = mesh.vertex_handle(v_index);
+
+		MyMesh::Point point = mesh.point(it_h);
+		vector<MyMesh::Normal> normal_face_array;
+		vector<MyMesh::Normal> normal_face_op_array;
+		vector<MyMesh::HalfedgeHandle> heh_direction_array;
+		vector<MyMesh::HalfedgeHandle> heh_ne_direction_array;
+
+		MyMesh::Normal normal_point(VerticesNormal[it_h.idx()][0], VerticesNormal[it_h.idx()][1], VerticesNormal[it_h.idx()][2]);
+
+
+		// minimum/maximum adjacent edge length
+		double max_edge_length = -1;
+		double min_edge_length = MAX;
+		for (MyMesh::VertexIHalfedgeIter vih_it = mesh.vih_iter(it_h); vih_it.is_valid(); vih_it++)
+		{
+			double edge_length = (mesh.point(mesh.to_vertex_handle(*vih_it)) - mesh.point(mesh.from_vertex_handle(*vih_it))).length();
+			max_edge_length = (edge_length > max_edge_length) ? edge_length : max_edge_length;
+			min_edge_length = (edge_length < min_edge_length) ? edge_length : min_edge_length;
+		}
+		if (max_edge_length < 0 || min_edge_length >= MAX) continue;
+
+
+		// traverse adjacent halfedge
+		for (MyMesh::VertexIHalfedgeIter vih_it = mesh.vih_iter(it_h); vih_it.is_valid(); vih_it++)
+		{
+			MyMesh::HalfedgeHandle heh = (*vih_it);
+			MyMesh::HalfedgeHandle heh_op = mesh.opposite_halfedge_handle(*vih_it);
+			MyMesh::HalfedgeHandle heh_ne = mesh.next_halfedge_handle(*vih_it);
+			MyMesh::HalfedgeHandle heh_nene = mesh.next_halfedge_handle(heh_ne);
+			MyMesh::HalfedgeHandle heh_oppr = mesh.prev_halfedge_handle(heh_op);
+			MyMesh::HalfedgeHandle heh_opne = mesh.next_halfedge_handle(heh_op);
+			MyMesh::Normal heh_vec = mesh.point(mesh.to_vertex_handle(heh)) - mesh.point(mesh.from_vertex_handle(heh));
+			MyMesh::Normal heh_op_vec = mesh.point(mesh.to_vertex_handle(heh_op)) - mesh.point(mesh.from_vertex_handle(heh_op));
+			MyMesh::Normal heh_ne_vec = mesh.point(mesh.to_vertex_handle(heh_ne)) - mesh.point(mesh.from_vertex_handle(heh_ne));
+			MyMesh::Normal heh_nene_vec = mesh.point(mesh.to_vertex_handle(heh_nene)) - mesh.point(mesh.from_vertex_handle(heh_nene));
+			MyMesh::Normal heh_oppr_vec = mesh.point(mesh.to_vertex_handle(heh_oppr)) - mesh.point(mesh.from_vertex_handle(heh_oppr));
+			MyMesh::Normal heh_opne_vec = mesh.point(mesh.to_vertex_handle(heh_opne)) - mesh.point(mesh.from_vertex_handle(heh_opne));
+			MyMesh::Normal normal_face = { 0, 0, 0 };
+			MyMesh::Normal normal_face_op = { 0, 0, 0 };
+			if (!mesh.is_boundary(heh))
+			{
+				normal_face = MyMesh::Normal(FacesNormal[mesh.face_handle(heh).idx()][0], FacesNormal[mesh.face_handle(heh).idx()][1], FacesNormal[mesh.face_handle(heh).idx()][2]);
+			}
+			if (!mesh.is_boundary(heh_op))
+			{
+				normal_face_op = MyMesh::Normal(FacesNormal[mesh.face_handle(heh_op).idx()][0], FacesNormal[mesh.face_handle(heh_op).idx()][1], FacesNormal[mesh.face_handle(heh_op).idx()][2]);
+			}
+			if (mesh.is_boundary(heh))
+			{
+				normal_face = -normal_face_op;
+			}
+			if (mesh.is_boundary(heh_op))
+			{
+				normal_face_op = -normal_face;
+			}
+
+			MyMesh::Normal normal_edge = { 0, 0, 0 };
+			normal_edge = (normal_face + normal_face_op).normalized();
+			if (isnan(normal_edge[0]) || isnan(normal_edge[1]) || isnan(normal_edge[2]))
+			{
+				normal_edge = { 0, 0, 0 };
+			}
+
+			// generate edge's multiple normal
+			vector<MyMesh::Normal> generate_edge_normal_array;
+			bool right_sample = false;
+			bool reverse_sample = false;
+			if (normal_face.length() > EPS && normal_face_op.length() > EPS)
+			{
+				double rot_angle = safetyAcos(normal_face | normal_face_op);
+				double inter_num = round(rot_angle / sample_angle);
+				if (inter_num < 3) inter_num = 3;
+				double inter_angle_space_cur = rot_angle / double(inter_num);
+
+				MyMesh::Normal rotate_normal;
+				if (mesh.is_boundary(heh) || mesh.is_boundary(heh_op))
+				{
+					rotate_normal = heh_vec;
+				}
+				else
+				{
+					if (safetyAcos((normal_face % normal_face_op).normalized() | heh_vec.normalized()) > 90)
+					{
+						rotate_normal = -heh_vec;
+					}
+					else
+					{
+						rotate_normal = heh_vec;
+					}
+				}
+
+				// determine whether sampling is required
+				MyMesh::Normal heh_face_dir = (normal_face % heh_vec).normalized();
+				double deter_angle = safetyAcos(normal_face_op | heh_face_dir);
+				if (rot_angle < 179)
+				{
+					if (offset > 0)
+					{
+						if (deter_angle < 90)
+						{
+							right_sample = false;
+							reverse_sample = true;
+						}
+						else
+						{
+							right_sample = true;
+							reverse_sample = false;
+						}
+					}
+					else
+					{
+						if (deter_angle < 90)
+						{
+							right_sample = true;
+							reverse_sample = false;
+						}
+						else
+						{
+							right_sample = false;
+							reverse_sample = true;
+						}
+					}
+				}
+				else
+				{
+					right_sample = true;
+					reverse_sample = false;
+				}
+
+				// if the arc length is too small, the sample will not be taken
+				if (((offset * normal_face) - (offset * normal_face_op)).length() >= sample_dis)
+				{
+					if (rot_angle >= inter_angle_space_cur)
+					{
+						generate_edge_normal_array.push_back(normal_face);
+					}
+
+					for (double ang_tmp = inter_angle_space_cur; ang_tmp < rot_angle; ang_tmp += inter_angle_space_cur)
+					{
+						generate_edge_normal_array.push_back(Slerp(normal_face, normal_face_op, rotate_normal, ang_tmp));
+					}
+
+					if (rot_angle >= inter_angle_space_cur)
+					{
+						generate_edge_normal_array.push_back(normal_face_op);
+					}
+				}
+				else
+				{
+					generate_edge_normal_array.push_back(normal_edge);
+				}
+			}
+			else
+			{
+				if (normal_face.length() > EPS)
+				{
+					generate_edge_normal_array.push_back(normal_face);
+				}
+				if (normal_face_op.length() > EPS)
+				{
+					generate_edge_normal_array.push_back(normal_face_op);
+				}
+			}
+
+			normal_face_array.push_back(normal_face);
+			normal_face_op_array.push_back(normal_face_op);
+			heh_direction_array.push_back(heh);
+			heh_ne_direction_array.push_back(heh_ne);
+
+			// sample edge
+			if (isOffsetEdge)
+			{
+				double sample_num = round(0.5 * heh_vec.length() / sample_dis);
+				if (sample_num < 1) sample_num = 1;
+				double edge_space = 0.5 * heh_vec.length() / double(sample_num) * edge_sample_par;
+				if (edge_space <= 0) continue;
+
+				// boundary edge sampling setting
+				// if (mesh.is_boundary(it_h)) edge_space /= 4;
+
+				double interlace = 0.5;
+				for (int i = 0; i < generate_edge_normal_array.size(); i++)
+				{
+					if (right_sample)
+					{
+						MyMesh::Point tmpP = point + generate_edge_normal_array[i] * abs(offset);
+
+						MyPoint offset_point;
+						offset_point.cor = Eigen::Vector3d(tmpP[0], tmpP[1], tmpP[2]);
+						offset_point.nor = Eigen::Vector3d(generate_edge_normal_array[i][0], generate_edge_normal_array[i][1], generate_edge_normal_array[i][2]);
+
+						offset_points_openmp[v_index].push_back(offset_point);
+					}
+					if (reverse_sample)
+					{
+						MyMesh::Point tmpP = point - generate_edge_normal_array[i] * abs(offset);
+
+						MyPoint offset_point;
+						offset_point.cor = Eigen::Vector3d(tmpP[0], tmpP[1], tmpP[2]);
+						offset_point.nor = Eigen::Vector3d(-generate_edge_normal_array[i][0], -generate_edge_normal_array[i][1], -generate_edge_normal_array[i][2]);
+
+						offset_points_openmp[v_index].push_back(offset_point);
+					}
+
+					for (double space_tmp = interlace * edge_space; space_tmp <= 0.5 * heh_vec.length(); space_tmp += edge_space)
+					{
+						if (right_sample)
+						{
+							MyMesh::Point tmpP2 = point - space_tmp * heh_vec.normalized() + generate_edge_normal_array[i] * abs(offset);
+
+							MyPoint offset_point2;
+							offset_point2.cor = Eigen::Vector3d(tmpP2[0], tmpP2[1], tmpP2[2]);
+							offset_point2.nor = Eigen::Vector3d(generate_edge_normal_array[i][0], generate_edge_normal_array[i][1], generate_edge_normal_array[i][2]);
+
+							offset_points_openmp[v_index].push_back(offset_point2);
+						}
+						if (reverse_sample)
+						{
+							MyMesh::Point tmpP2 = point - space_tmp * heh_vec.normalized() - generate_edge_normal_array[i] * abs(offset);
+
+							MyPoint offset_point2;
+							offset_point2.cor = Eigen::Vector3d(tmpP2[0], tmpP2[1], tmpP2[2]);
+							offset_point2.nor = Eigen::Vector3d(-generate_edge_normal_array[i][0], -generate_edge_normal_array[i][1], -generate_edge_normal_array[i][2]);
+
+							offset_points_openmp[v_index].push_back(offset_point2);
+						}
+					}
+
+					if (interlace == 0.5) interlace = 1;
+					else if (interlace == 1) interlace = 0.5;
+				}
+			}
+		}
+
+		// sample vertex (sphere)
+		if (isOffsetPoint)
+		{
+			if (mesh.is_boundary(it_h))
+			{
+				for (int he_i = 0; he_i < heh_direction_array.size(); he_i++)
+				{
+					MyMesh::HalfedgeHandle hh = heh_direction_array[he_i];
+					MyMesh::HalfedgeHandle hh_op = mesh.opposite_halfedge_handle(hh);
+					MyMesh::HalfedgeHandle hh_ne = mesh.next_halfedge_handle(hh);
+					MyMesh::HalfedgeHandle hh_ne_op = mesh.opposite_halfedge_handle(hh_ne);
+
+					MyMesh::Normal hh_vec = mesh.point(mesh.to_vertex_handle(hh)) - mesh.point(mesh.from_vertex_handle(hh));
+					MyMesh::Normal hh_ne_vec = mesh.point(mesh.to_vertex_handle(hh_ne)) - mesh.point(mesh.from_vertex_handle(hh_ne));
+					hh_vec.normalize();
+					hh_ne_vec.normalize();
+
+					if (mesh.is_boundary(hh))
+					{
+						Eigen::Vector3d hh_normal_e = FacesNormal[mesh.face_handle(hh_op).idx()];
+						Eigen::Vector3d hh_ne_normal_e = FacesNormal[mesh.face_handle(hh_ne_op).idx()];
+						MyMesh::Normal hh_normal = { hh_normal_e.x(), hh_normal_e.y(), hh_normal_e.z() };
+						MyMesh::Normal hh_ne_normal = { hh_ne_normal_e.x(), hh_ne_normal_e.y(), hh_ne_normal_e.z() };
+
+						//cout << safetyAcos(hh_normal.dot(hh_ne_normal)) << ", " << sample_angle << endl;
+						if (safetyAcos(hh_normal.dot(hh_ne_normal)) < sample_angle)
+						{
+							int cur_n_sample_num = 180 / sample_angle;
+							double cur_n_inter_angle_space = 180 / double(cur_n_sample_num);
+
+							double hh_hh_ne_anlge = safetyAcos(hh_vec.dot(hh_ne_vec));
+							if (hh_hh_ne_anlge < sample_angle) hh_hh_ne_anlge = sample_angle;
+							int cur_hh_sample_num = hh_hh_ne_anlge / sample_angle;
+							if (cur_hh_sample_num < 1) cur_hh_sample_num = 1;
+							double cur_hh_inter_angle_space = hh_hh_ne_anlge / double(cur_hh_sample_num);
+
+							for (double ang_tmp = 0; ang_tmp < hh_hh_ne_anlge; ang_tmp += cur_hh_inter_angle_space)
+							{
+								MyMesh::Normal cur_Slerp_x = Slerp(-hh_vec, hh_ne_vec, -hh_normal, ang_tmp);
+
+								for (double ang_tmp2 = 0; ang_tmp2 < 180; ang_tmp2 += cur_n_inter_angle_space)
+								{
+									MyMesh::Normal normal_tmp = Slerp(hh_normal, -hh_normal, cur_Slerp_x, ang_tmp2);
+
+									MyMesh::Point tmpP = point + normal_tmp * abs(offset);
+									MyPoint offset_point;
+									offset_point.cor = Eigen::Vector3d(tmpP[0], tmpP[1], tmpP[2]);
+									offset_point.nor = Eigen::Vector3d(normal_tmp[0], normal_tmp[1], normal_tmp[2]);
+
+									offset_points_openmp[v_index].push_back(offset_point);
+
+									/*
+									MyMesh::Normal normal_tmp2 = Slerp(hh_ne_normal, -hh_ne_normal, cur_Slerp_x, ang_tmp2);
+
+									MyMesh::Point tmpP2 = point + normal_tmp2 * abs(offset);
+									MyPoint offset_point2;
+									offset_point2.cor = Eigen::Vector3d(tmpP2[0], tmpP2[1], tmpP2[2]);
+									offset_point2.nor = Eigen::Vector3d(normal_tmp2[0], normal_tmp2[1], normal_tmp2[2]);
+
+									offset_points_openmp[v_index].push_back(offset_point2);*/
+								}
+							}
+
+							break;
+						}
+						else
+						{
+							for (int b = 0; b < ball_normals_array.size(); b++)
+							{
+								MyMesh::Point tmpP = point + ball_normals_array[b] * abs(offset);
+								MyPoint offset_point;
+								offset_point.cor = Eigen::Vector3d(tmpP[0], tmpP[1], tmpP[2]);
+								offset_point.nor = Eigen::Vector3d(ball_normals_array[b][0], ball_normals_array[b][1], ball_normals_array[b][2]);
+
+								offset_points_openmp[v_index].push_back(offset_point);
+							}
+							break;
+						}
+					}
+				}
+			}
+			else
+			{
+				double point_inter_par = 1;
+				for (size_t i = 0; i < normal_face_array.size(); i++)
+				{
+					MyMesh::Normal normal_face = normal_face_array[i];
+					MyMesh::Normal normal_face_op = normal_face_op_array[i];
+					if (((offset * normal_face) - (offset * normal_face_op)).length() < sample_dis) continue;
+
+					if (normal_face.length() > EPS && normal_face_op.length() > EPS)
+					{
+						double rot_point_normal = safetyAcos(normal_point | normal_face);
+						double rot_point_normal_op = safetyAcos(normal_point | normal_face_op);
+						double sample_point_normal = round(rot_point_normal / sample_angle * point_inter_par);
+						double sample_point_normal_op = round(rot_point_normal_op / sample_angle * point_inter_par);
+						if (sample_point_normal < 1) sample_point_normal = 1;
+						if (sample_point_normal_op < 1) sample_point_normal_op = 1;
+						double inter_angle_point_normal = rot_point_normal / sample_point_normal;
+						double inter_angle_point_normal_op = rot_point_normal_op / sample_point_normal_op;
+
+						MyMesh::Normal npXnf = normal_point % normal_face;
+						MyMesh::Normal npXnfop = normal_point % normal_face_op;
+						while (rot_point_normal > 0 && rot_point_normal_op > 0)
+						{
+							MyMesh::Normal cur_normal_face = Slerp(normal_point, normal_face, npXnf, rot_point_normal);
+							MyMesh::Normal cur_normal_face_op = Slerp(normal_point, normal_face_op, npXnfop, rot_point_normal_op);
+
+							double cur_rot_angle = safetyAcos(cur_normal_face | cur_normal_face_op);
+							int cur_sample_num = cur_rot_angle / sample_angle * point_inter_par;
+							double cur_inter_angle_space = cur_rot_angle / double(cur_sample_num);
+
+							MyMesh::Normal cfXcfop = cur_normal_face % cur_normal_face_op;
+							for (double ang_tmp = 0.5 * cur_inter_angle_space; ang_tmp < cur_rot_angle; ang_tmp += cur_inter_angle_space)
+							{
+								MyMesh::Normal normal_tmp = Slerp(cur_normal_face, cur_normal_face_op, cfXcfop, ang_tmp);
+
+								MyMesh::Point tmpP = point + normal_tmp * abs(offset);
+								MyPoint offset_point;
+								offset_point.cor = Eigen::Vector3d(tmpP[0], tmpP[1], tmpP[2]);
+								offset_point.nor = Eigen::Vector3d(normal_tmp[0], normal_tmp[1], normal_tmp[2]);
+
+								offset_points_openmp[v_index].push_back(offset_point);
+
+								MyMesh::Point tmpP2 = point - normal_tmp * abs(offset);
+								MyPoint offset_point2;
+								offset_point2.cor = Eigen::Vector3d(tmpP2[0], tmpP2[1], tmpP2[2]);
+								offset_point2.nor = Eigen::Vector3d(-normal_tmp[0], -normal_tmp[1], -normal_tmp[2]);
+
+								offset_points_openmp[v_index].push_back(offset_point2);
+							}
+
+							rot_point_normal -= inter_angle_point_normal;
+							rot_point_normal_op -= inter_angle_point_normal_op;
+						}
+					}
+				}
+			}
+		}
+	}
+	// convert openmp
+	for (int i = 0; i < offset_points_openmp.size(); i++)
+	{
+		offset_points.insert(offset_points.end(), offset_points_openmp[i].begin(), offset_points_openmp[i].end());
+	}
+
+	// offset face
+	if (isOffsetFace)
+	{
+		vector<Utils_sampling::Vec3> verts_vec3;
+		vector<Utils_sampling::Vec3> nors_vec3;
+
+		vector<int> tris;
+		vector<MyMesh::Point> samples_pos;
+		vector<MyMesh::Normal> samples_nor;
+		int point_cnt = 0;
+		for (MyMesh::FaceIter f_it = mesh.faces_begin(); f_it != mesh.faces_end(); f_it++)
+		{
+			std::vector<MyMesh::Point> face_points;
+			for (MyMesh::FaceVertexIter fv_it = mesh.fv_begin(*f_it); fv_it != mesh.fv_end(*f_it); fv_it++)
+			{
+				face_points.push_back(mesh.point(*fv_it));
+			}
+
+			MyMesh::Normal vec_normal(FacesNormal[(*f_it).idx()].x(), FacesNormal[(*f_it).idx()].y(), FacesNormal[(*f_it).idx()].z());
+
+			for (size_t i = 0; i < face_points.size(); i++)
+			{
+				Utils_sampling::Vec3 point_vec3 = { face_points[i][0], face_points[i][1], face_points[i][2] };
+				verts_vec3.push_back(point_vec3);
+
+				Utils_sampling::Vec3 normal_vec3 = { vec_normal[0], vec_normal[1], vec_normal[2] };
+				nors_vec3.push_back(normal_vec3);
+				tris.push_back(point_cnt++);
+			}
+		}
+
+		std::vector<Utils_sampling::Vec3> samples_pos_vec3;
+		std::vector<Utils_sampling::Vec3> samples_nor_vec3;
+		Utils_sampling::poisson_disk(sample_dis * face_sample_par, 100, verts_vec3, nors_vec3, tris, samples_pos_vec3, samples_nor_vec3);
+
+		for (size_t i = 0; i < samples_pos_vec3.size(); i++)
+		{
+			MyPoint offset_point;
+			offset_point.cor = Eigen::Vector3d(samples_pos_vec3[i].x, samples_pos_vec3[i].y, samples_pos_vec3[i].z);
+			offset_point.nor = Eigen::Vector3d(samples_nor_vec3[i].x, samples_nor_vec3[i].y, samples_nor_vec3[i].z);
+			offset_point.cor = offset_point.cor + offset * offset_point.nor;
+			offset_points.push_back(offset_point);
+
+			MyPoint offset_point2;
+			offset_point2.cor = Eigen::Vector3d(samples_pos_vec3[i].x, samples_pos_vec3[i].y, samples_pos_vec3[i].z);
+			offset_point2.nor = Eigen::Vector3d(-samples_nor_vec3[i].x, -samples_nor_vec3[i].y, -samples_nor_vec3[i].z);
+			offset_point2.cor = offset_point2.cor + offset * offset_point2.nor;
+			offset_points.push_back(offset_point2);
+		}
+	}
+
+
+	// done
+	tInfo.t_offseting += time.time();
+
+
+	// DEBUG
+	if (DEBUG_MODE)
+	{
+		ofstream offset_points_out("..//data//2_Offset_Points.obj");
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			offset_points_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << endl;
+		}
+		offset_points_out.close();
+
+		ofstream offset_boundary_point_out("..//data//2_Offset_Points_Boundary.obj");
+		vector <vector<int>> group_color;
+		for (int i = 0; i < Mesh.bloopnum; i++)
+		{
+			int color_r = (rand() % (255));
+			int color_g = (rand() % (255));
+			int color_b = (rand() % (255));
+			vector<int> group_rgb = { color_r, color_g, color_b };
+			group_color.push_back(group_rgb);
+		}
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsBoundary && offset_points[i].BoundaryIndex != -1)
+			{
+				offset_boundary_point_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << " "
+					<< group_color[offset_points[i].BoundaryIndex][0] << " " << group_color[offset_points[i].BoundaryIndex][1] << " " << group_color[offset_points[i].BoundaryIndex][2] << endl;
+			}
+		}
+		offset_boundary_point_out.close();
+	}
+
+
+	return OFFSETPOINTSUCCESS;
+}
+
+int OffsetPointFiltering(MeshInfo& Mesh,
+	std::vector<MyPoint>& offset_points,
+	double offset,
+	TimeInfo& tInfo)
+{
+	if (Mesh.mesh.n_vertices() < 3 || Mesh.mesh.n_faces() == 0)
+	{
+		return FILTERMESHERROR;
+	}
+
+	// init
+	CGAL::Timer time;
+	time.start();
+	int numProcs = omp_get_num_procs();
+	double sq_offset = pow(offset, 2);
+	omp_set_num_threads(2 * numProcs - 1);
+
+	// filter out too close point
+	PointCloud<double> cloud;
+	cloud.pts.resize(offset_points.size());
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		cloud.pts[i].x = offset_points[i].cor.x();
+		cloud.pts[i].y = offset_points[i].cor.y();
+		cloud.pts[i].z = offset_points[i].cor.z();
+	}
+	my_kd_tree_t index(3 /*dim*/, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10 /* max leaf */));
+	index.buildIndex();
+	vector<bool> TooCloseToDelete(offset_points.size(), false);
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (TooCloseToDelete[i]) continue;
+		double query_pt[3] = { offset_points[i].cor.x(),offset_points[i].cor.y(), offset_points[i].cor.z() };
+		vector<std::pair<uint32_t, double>> ret_matches;
+		nanoflann::SearchParams params;
+		const double search_radius = static_cast<double>(pow(1e-4, 2));
+		const size_t nMatches = index.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+		if (nMatches > 0)
+		{
+			for (int j = 0; j < nMatches; j++)
+			{
+				TooCloseToDelete[ret_matches[j].first] = true;
+			}
+			TooCloseToDelete[i] = false;
+		}
+	}
+	vector<MyPoint> offset_points_tmp;
+	for (int i = 0; i < TooCloseToDelete.size(); i++)
+	{
+		if (!TooCloseToDelete[i])
+		{
+			offset_points_tmp.push_back(offset_points[i]);
+		}
+	}
+	offset_points = offset_points_tmp;
+
+	// filter out not offset points
+#pragma omp parallel for
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		AABB_Point query(offset_points[i].cor[0], offset_points[i].cor[1], offset_points[i].cor[2]);
+		double qd = Mesh.tree.squared_distance(query);
+		//cout << qd <<", " << sq_offset << endl;
+
+		if (abs(qd - sq_offset) > EPS)
+		{
+			offset_points[i].IsDelete = true;
+		}
+	}
+
+	// done
+	tInfo.t_filtering += time.time();
+
+	// DEBUG
+	if (DEBUG_MODE)
+	{
+		ofstream filtered_points_out("..//data//3_Offset_Points_Filtered.obj");
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsDelete) continue;
+			filtered_points_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << endl;
+		}
+		filtered_points_out.close();
+
+		ofstream offset_boundary_point_out("..//data//3_Offset_Points_Filtered_Boundary.obj");
+		vector <vector<int>> group_color;
+		for (int i = 0; i < Mesh.bloopnum; i++)
+		{
+			int color_r = (rand() % (255));
+			int color_g = (rand() % (255));
+			int color_b = (rand() % (255));
+			vector<int> group_rgb = { color_r, color_g, color_b };
+			group_color.push_back(group_rgb);
+		}
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsDelete) continue;
+
+			if (offset_points[i].IsBoundary && offset_points[i].BoundaryIndex != -1)
+			{
+				offset_boundary_point_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << " "
+					<< group_color[offset_points[i].BoundaryIndex][0] << " " << group_color[offset_points[i].BoundaryIndex][1] << " " << group_color[offset_points[i].BoundaryIndex][2] << endl;
+			}
+		}
+		offset_boundary_point_out.close();
+
+		ofstream filtered_normals_out("..//data//3_Offset_Points_Filtered_Normals.obj");
+		int p_cnt = 0;
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsDelete) continue;
+			filtered_normals_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << " " << "255 233 79" << endl;
+
+			Eigen::Vector3d np = offset_points[i].cor + 0.01 * offset_points[i].nor;
+			filtered_normals_out << "v" << " " << np.x() << " " << np.y() << " " << np.z() << " " << "255 255 255" << endl;
+
+			filtered_normals_out << "l" << " " << 2 * p_cnt + 1 << " " << 2 * p_cnt + 2 << endl;
+
+			p_cnt++;
+		}
+		filtered_normals_out.close();
+	}
+
+	return FILTERSUCCESS;
+}
+
+int FeaturePointGeneration(MeshInfo& Mesh,
+	std::vector<MyPoint>& offset_points,
+	double offset,
+	double sample_par,
+	TimeInfo& tInfo)
+{
+	// init
+	double identify_search_radius = 1.5 * sample_par * Mesh.obbdiag;
+	double neighborhood_search_radius = 2 * sample_par * Mesh.obbdiag;
+	double optimize_radius = 0.5 * sample_par * Mesh.obbdiag;
+	double minAngle = 15;
+	double maxAngle = 170;
+	double sq_offset = pow(offset, 2);
+	CGAL::Timer time;
+	time.start();
+
+
+	// init kd tree
+	PointCloud<double> cloud;
+	cloud.pts.resize(offset_points.size());
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		cloud.pts[i].x = offset_points[i].cor[0];
+		cloud.pts[i].y = offset_points[i].cor[1];
+		cloud.pts[i].z = offset_points[i].cor[2];
+	}
+	my_kd_tree_t   index(3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+	index.buildIndex();
+
+
+	// identify potential feature points
+	vector<vector<int>> Neighbors;
+	vector<double> pca_sigma(offset_points.size(), 0);
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		vector<int> Ntmp;
+		Neighbors.push_back(Ntmp);
+	}
+	// identify
+#pragma omp parallel for
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+		if (offset_points[i].IsBoundary) continue;
+
+		double query_pt[3] = { offset_points[i].cor[0], offset_points[i].cor[1], offset_points[i].cor[2] };
+		vector<std::pair<uint32_t, double>> ret_matches;
+		nanoflann::SearchParams params;
+		const double search_radius = static_cast<double>(pow(identify_search_radius, 2));
+		const size_t nMatches = index.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+		vector<int> Ntmp;
+		int num_deleted = 0;
+		for (size_t j = 0; j < nMatches; j++)
+		{
+			if (!offset_points[ret_matches[j].first].IsDelete)
+			{
+				num_deleted++;
+			}
+		}
+		if (abs(double(num_deleted) / double(nMatches) - 0.5) < 0.5) // 0.4
+		{
+			offset_points[i].IsFeature = true;
+			// offset_points[i].IsDelete = false;
+		}
+	}
+	// neighbor points
+#pragma omp parallel for
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (!offset_points[i].IsFeature) continue;
+
+		double query_pt[3] = { offset_points[i].cor[0], offset_points[i].cor[1], offset_points[i].cor[2] };
+		vector<std::pair<uint32_t, double>> ret_matches;
+		nanoflann::SearchParams params;
+		const double search_radius = static_cast<double>(pow(neighborhood_search_radius, 2));
+		const size_t nMatches = index.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+		vector<int> Ntmp;
+		int num_deleted = 0;
+		// init neighbor
+		for (size_t j = 0; j < nMatches; j++)
+		{
+			Ntmp.push_back(ret_matches[j].first);
+		}
+
+		Neighbors[i] = Ntmp;
+	}
+	// k-means
+	vector<Eigen::Vector3d> PotentialNormals(offset_points.size());
+#pragma omp parallel for
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (!offset_points[i].IsFeature) continue;
+
+		alglib::clusterizerstate s;
+		alglib::kmeansreport rep;
+		alglib::real_2d_array xy; // two normals of the neighborhood of point i
+		int k = Neighbors[i].size();
+		xy.setlength(k, 3);
+		for (int j = 0; j < k; j++)
+		{
+			xy[j][0] = offset_points[Neighbors[i][j]].cor[0];
+			xy[j][1] = offset_points[Neighbors[i][j]].nor[1];
+			xy[j][2] = offset_points[Neighbors[i][j]].nor[2];
+		}
+		alglib::clusterizercreate(s);
+		alglib::clusterizersetpoints(s, xy, 2);
+		alglib::clusterizersetkmeanslimits(s, 10, 0);
+		alglib::clusterizerrunkmeans(s, 2, rep);
+
+		Eigen::Vector3d C1, C2;
+		if (int(rep.terminationtype) == -3)
+		{
+			C1 = offset_points[i].nor;
+			C2 = offset_points[i].nor;
+		}
+		else
+		{
+			C1[0] = rep.c[0][0];
+			C1[1] = rep.c[0][1];
+			C1[2] = rep.c[0][2];
+			C2[0] = rep.c[1][0];
+			C2[1] = rep.c[1][1];
+			C2[2] = rep.c[1][2];
+		}
+		C1 = C1.normalized();
+		C2 = C2.normalized();
+
+		double AngleBetween = safetyAcos(C1.dot(C2));
+
+		
+		/*if (AngleBetween < minAngle || AngleBetween > maxAngle)
+		{
+			offset_points[i].IsFeature = false;
+		}
+		else
+		{
+			PotentialNormals[i] = (C1 + C2).normalized();
+		}*/
+		PotentialNormals[i] = (C1 + C2).normalized();
+	}
+	// cluster normals
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (!offset_points[i].IsFeature) continue;
+
+		vector<Eigen::Vector3d> nei_normals;
+		vector<int> nei_clusters;
+
+		for (int j = 0; j < Neighbors[i].size(); j++)
+		{
+			nei_normals.push_back(offset_points[Neighbors[i][j]].nor);
+		}
+
+		if (GaussMapCluster(nei_normals, 10, nei_clusters) <= 1)
+		{
+			offset_points[i].IsFeature = false;
+		}
+
+		PotentialNormals[i] = Eigen::Vector3d(0, 0, 0);
+		for (int j = 0; j < nei_normals.size(); j++)
+		{
+			if (nei_clusters[j] == j)
+			{
+				PotentialNormals[j] += nei_normals[j];
+			}
+		}
+		PotentialNormals[i] = PotentialNormals[i].normalized();
+	}
+	// get feature num
+	int feature_num = 0;
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+		if (offset_points[i].IsFeature)
+		{
+			feature_num++;
+		}
+	}
+	// DEBUG
+	if (DEBUG_MODE)
+	{
+		time.stop();
+		ofstream potential_points_out("..//data//4_Potential_Feature_Points.obj");
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (!offset_points[i].IsFeature) continue;
+			potential_points_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << endl;
+		}
+		potential_points_out.close();
+		time.start();
+	}
+
+
+	// generate feature points
+	// lbfgs
+	if (1) 
+	{
+		// build feture points' kd tree
+		vector<vector<int>> F_Neighbors;
+		PointCloud<double> feature_cloud;
+		feature_cloud.pts.resize(feature_num);
+		int fi = 0;
+		map<int, int> fea_2_ori;
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsFeature)
+			{
+				feature_cloud.pts[fi].x = offset_points[i].cor.x();
+				feature_cloud.pts[fi].y = offset_points[i].cor.y();
+				feature_cloud.pts[fi].z = offset_points[i].cor.z();
+				fea_2_ori[fi] = i;
+				fi++;
+			}
+		}
+		my_kd_tree_t   feature_index(3, feature_cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+		feature_index.buildIndex();
+		// get feature points' feature neighborhood
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			vector<int> Ntmp;
+			F_Neighbors.push_back(Ntmp);
+		}
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (!offset_points[i].IsFeature) continue;
+
+			vector<int> Ntmp;
+
+			double query_pt[3] = { offset_points[i].cor[0], offset_points[i].cor[1], offset_points[i].cor[2] };
+			vector<std::pair<uint32_t, double>> ret_matches;
+			nanoflann::SearchParams params;
+
+			if (1)
+			{
+				// distance knn
+				const double search_radius = static_cast<double>(pow(2 * identify_search_radius, 2));
+				const size_t nMatches = feature_index.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+				for (size_t j = 0; j < nMatches; j++)
+				{
+					if (fea_2_ori[ret_matches[j].first] == i) continue;
+
+					Ntmp.push_back(fea_2_ori[ret_matches[j].first]);
+				}
+			}
+			else
+			{
+				// num knn
+				int knn_num = 8;
+				vector<uint32_t> indices(knn_num);
+				vector<double> distances(knn_num);
+				feature_index.knnSearch(&query_pt[0], knn_num, &indices[0], &distances[0]);
+				for (size_t j = 0; j < knn_num; j++)
+				{
+					if (fea_2_ori[indices[j]] == i) continue;
+
+					Ntmp.push_back(fea_2_ori[indices[j]]);
+				}
+			}
+
+			F_Neighbors[i] = Ntmp;
+		}
+
+#pragma omp parallel for
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (!offset_points[i].IsFeature) continue;
+			if (offset_points[i].IsBoundary) continue;
+
+			std::function<void(const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)> function_grad
+				= [&](const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)
+				{
+					func = 0.0;
+					grad[0], grad[1], grad[2] = 0.0, 0.0, 0.0;
+					double mu = 0.001;
+					double mu2 = 1e-8;
+
+					Eigen::Vector3d zi(x[0], x[1], x[2]);
+					Eigen::Vector3d zipj;
+					Eigen::Vector3d g(0, 0, 0);
+					double tmp;
+
+					// tangent plane cut
+					for (int j = 0; j < Neighbors[i].size(); j++)
+					{
+						zipj = zi - offset_points[Neighbors[i][j]].cor;
+						tmp = zipj.dot(offset_points[Neighbors[i][j]].nor);
+
+						func += pow(tmp, 2);
+						g += 2 * tmp * offset_points[Neighbors[i][j]].nor;
+					}
+
+					// calc feature neighborhood PCA
+					/*
+					Eigen::Vector3d aveP({ 0, 0, 0 });
+					for (int j = 0; j < F_Neighbors[i].size(); j++)
+					{
+						aveP = aveP + offset_points[F_Neighbors[i][j]].cor;
+					}
+					aveP = aveP / F_Neighbors[i].size();
+					Eigen::MatrixXd covMat0(3, nMatches2);
+					for (int j = 0; j < nMatches2; j++)
+					{
+						covMat0.col(j) = Eigen::Vector3d(feature_cloud.pts[ret_matches2[j].first].x, feature_cloud.pts[ret_matches2[j].first].y, feature_cloud.pts[ret_matches2[j].first].z) - aveN;
+					}
+					Eigen::MatrixXd covMat = (covMat0 * covMat0.transpose());
+					Eigen::JacobiSVD<Eigen::MatrixXd> svd(covMat, Eigen::ComputeFullU | Eigen::ComputeFullV);
+					//cout << svd.singularValues()[0] << ", " << svd.singularValues()[1] << ", " << svd.singularValues()[2] << endl;
+					// double balance_parameter = sqrt(svd.singularValues()[0]) / (sqrt(svd.singularValues()[0]) + sqrt(svd.singularValues()[1]) + sqrt(svd.singularValues()[2]));
+					double balance_parameter = 1;*/
+
+					// feature points' distances
+					/*
+					for (int j = 0; j < F_Neighbors[i].size(); j++)
+					{
+						Eigen::Vector3d xk = offset_points[F_Neighbors[i][j]].cor;
+						Eigen::Vector3d xixk = zi - xk;
+						double dis = xixk.norm();
+
+						func += mu2 / (dis);
+						g -= mu2 / pow(dis, 3) * xixk;
+					}*/
+
+					/*
+					func += mu * (zi - offset_points[i].cor).squaredNorm();
+					g += 2 * mu * (zi - offset_points[i].cor);*/
+
+					grad[0] = g.x();
+					grad[1] = g.y();
+					grad[2] = g.z();
+				};
+
+			alglib::real_1d_array x = "[0,0,0]";
+			x.setlength(3);
+			x[0] = offset_points[i].cor[0];
+			x[1] = offset_points[i].cor[1];
+			x[2] = offset_points[i].cor[2];
+
+			alglib::real_1d_array s = "[1,1,1]";
+			double epsg = 0;
+			double epsf = 0;
+			double epsx = 0;
+			alglib::ae_int_t maxits = 0;
+			alglib::minbleicstate state;
+			alglib::minbleiccreate(x, state);
+			alglib::minbleicsetscale(state, s);
+			alglib::minbleicsetcond(state, epsg, epsf, epsx, maxits);
+			alglib::minbleicoptguardsmoothness(state);
+			alglib::minbleicoptguardgradient(state, 0.000001);
+			alglib::minbleicreport rep;
+			alglib::minbleicoptimize(state, function_grad);
+			alglib::minbleicresults(state, x, rep);
+
+			Eigen::Vector3d target(x[0], x[1], x[2]);
+
+			if ((offset_points[i].cor - target).norm() > 5 * identify_search_radius)
+			{
+				offset_points[i].IsDelete = true;
+				offset_points[i].IsFeature = false;
+				continue;
+			}
+
+			offset_points[i].cor = target;
+		}
+	}
+	// lbfgs global
+	vector<double> tangent_terms;
+	vector<double> tangent_grads;
+	vector<double> distance_terms;
+	vector<double> distance_grads;
+	if (0)
+	{
+		// init
+		nanoflann::SearchParams params;
+		alglib::real_1d_array x;
+		x.setlength(3 * feature_num);
+		map<int, int> ori_2_fea;
+		map<int, int> fea_2_ori;
+		int fi = 0;
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsFeature)
+			{
+				x[3 * fi] = offset_points[i].cor.x();
+				x[3 * fi + 1] = offset_points[i].cor.y();
+				x[3 * fi + 2] = offset_points[i].cor.z();
+
+				ori_2_fea[i] = fi;
+				fea_2_ori[fi] = i;
+				fi++;
+			}
+		}
+		alglib::real_1d_array s;
+		s.setlength(3 * feature_num);
+		for (int i = 0; i < feature_num; i++)
+		{
+			s[3 * i] = 1;
+			s[3 * i + 1] = 1;
+			s[3 * i + 2] = 1;
+		}
+		int func_calc_num = 0;
+		double mu = 0.001;
+		double mu2 = 1e-11; // 1e-8
+		double lambda1 = 1;
+		double lambda2 = 1;
+		vector<double> balance_parameter_arrays; // for test
+
+		// init func
+		std::function<void(const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)> function_grad
+			= [&](const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)
+			{
+				// init
+				func = 0.0;
+				for (int i = 0; i < feature_num; i++)
+				{
+					grad[3 * i] = 0.0;
+					grad[3 * i + 1] = 0.0;
+					grad[3 * i + 2] = 0.0;
+				}
+				tangent_terms.push_back(0);
+				tangent_grads.push_back(0);
+				distance_terms.push_back(0);
+				distance_grads.push_back(0);
+				balance_parameter_arrays.clear();
+
+				// build feature points' kd tree
+				PointCloud<double> feature_cloud;
+				feature_cloud.pts.resize(feature_num);
+				for (int j = 0; j < feature_num; j++)
+				{
+					feature_cloud.pts[j].x = x[3 * j];
+					feature_cloud.pts[j].y = x[3 * j + 1];
+					feature_cloud.pts[j].z = x[3 * j + 2];
+				}
+				my_kd_tree_t   feature_index(3, feature_cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+				feature_index.buildIndex();
+
+				// calc func and grad
+				for (int i = 0; i < feature_num; i++)
+				{
+					// init
+					Eigen::Vector3d xi(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+					double query_pt[3] = { xi.x(), xi.y(), xi.z() };
+
+					// tangent plane cut (fixed neighborhood)
+					double tmp_f = func;
+					Eigen::Vector3d tmp_g(grad[3 * i], grad[3 * i + 1], grad[3 * i + 2]);
+					for (int j = 0; j < Neighbors[fea_2_ori[i]].size(); j++)
+					{
+						Eigen::Vector3d xipj = xi - offset_points[Neighbors[fea_2_ori[i]][j]].cor;
+						double xipj_nj = xipj.dot(offset_points[Neighbors[fea_2_ori[i]][j]].nor);
+
+						func			+= lambda1 * pow(xipj_nj, 2);
+						grad[3 * i]		+= lambda1 * 2 * xipj_nj * offset_points[Neighbors[fea_2_ori[i]][j]].nor.x();
+						grad[3 * i + 1] += lambda1 * 2 * xipj_nj * offset_points[Neighbors[fea_2_ori[i]][j]].nor.y();
+						grad[3 * i + 2] += lambda1 * 2 * xipj_nj * offset_points[Neighbors[fea_2_ori[i]][j]].nor.z();
+					}
+					tangent_terms.back() = tangent_terms.back() + (func - tmp_f);
+					tmp_g = Eigen::Vector3d(grad[3 * i], grad[3 * i + 1], grad[3 * i + 2]) - tmp_g;
+					tangent_grads.back() = tangent_grads.back() + tmp_g.norm();
+
+					// tangent plane cut (dynamic neighborhood)
+					/*
+					vector<std::pair<uint32_t, double>> ret_matches;
+					const double search_radius = static_cast<double>(pow(identify_search_radius, 2));
+					const size_t nMatches = index.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+					for (int j = 0; j < nMatches; j++)
+					{
+						Eigen::Vector3d xipj = xi - offset_points[ret_matches[j].first].cor;
+						double xipj_nj = xipj.dot(offset_points[ret_matches[j].first].nor);
+
+						func += pow(xipj_nj, 2);
+						grad[3 * i] += 2 * xipj_nj * offset_points[ret_matches[j].first].nor.x();
+						grad[3 * i + 1] += 2 * xipj_nj * offset_points[ret_matches[j].first].nor.y();
+						grad[3 * i + 2] += 2 * xipj_nj * offset_points[ret_matches[j].first].nor.z();
+					}*/
+
+					// get feature neighborhood
+					vector<std::pair<uint32_t, double>> ret_matches2;
+					const double search_radius2 = static_cast<double>(pow(identify_search_radius, 2));
+					const size_t nMatches2 = feature_index.radiusSearch(&query_pt[0], search_radius2, ret_matches2, params);
+
+					// calc PCA
+					double balance_parameter = 1;
+					/*
+					if (nMatches2 <= 1)
+					{
+						balance_parameter = 0;
+					}
+					else
+					{
+						Eigen::Vector3d aveN({ 0, 0, 0 });
+						for (int j = 0; j < nMatches2; j++)
+						{
+							// if (ret_matches2[j].first == i) continue;
+							aveN = aveN + Eigen::Vector3d(feature_cloud.pts[ret_matches2[j].first].x, feature_cloud.pts[ret_matches2[j].first].y, feature_cloud.pts[ret_matches2[j].first].z);
+						}
+						aveN = aveN / (nMatches2);
+						Eigen::MatrixXd covMat = Eigen::MatrixXd::Zero(3, 3);
+
+						for (int j = 0; j < nMatches2; j++)
+						{
+							if (ret_matches2[j].first == i) continue;
+
+							Eigen::MatrixXd fp(3, 1);
+							fp << feature_cloud.pts[ret_matches2[j].first].x - aveN.x(), feature_cloud.pts[ret_matches2[j].first].y - aveN.y(), feature_cloud.pts[ret_matches2[j].first].z - aveN.z();
+
+							covMat = covMat + (fp * fp.transpose());
+						}
+						covMat = covMat / (nMatches2 - 1);
+
+						Eigen::JacobiSVD<Eigen::MatrixXd> svd(covMat, Eigen::ComputeFullU | Eigen::ComputeFullV);
+						double max_singular = max({ svd.singularValues()[0] , svd.singularValues()[1] , svd.singularValues()[2] });
+						balance_parameter = sqrt(max_singular) / (sqrt(svd.singularValues()[0]) + sqrt(svd.singularValues()[1]) + sqrt(svd.singularValues()[2]));
+					}
+					balance_parameter_arrays.push_back(balance_parameter);
+					balance_parameter = 0.05 * exp(-pow(balance_parameter - 1, 2) / 0.01);*/
+					
+					// distance
+					double tmp_f2 = func;
+					Eigen::Vector3d tmp_g2(grad[3 * i], grad[3 * i + 1], grad[3 * i + 2]);
+					for (int j = 0; j < nMatches2; j++)
+					{
+						if (ret_matches2[j].first == i)
+						{
+							continue;
+						}
+
+						Eigen::Vector3d xk(x[3 * ret_matches2[j].first], x[3 * ret_matches2[j].first + 1], x[3 * ret_matches2[j].first + 2]);
+						Eigen::Vector3d xixk = xi - xk;
+
+						double dis = xixk.norm();
+
+						//func			+= lambda2 * mu2 / (dis) * balance_parameter;
+						//grad[3 * i]		-= lambda2 * mu2 / pow(dis, 3) * xixk.x() * balance_parameter;
+						//grad[3 * i + 1] -= lambda2 * mu2 / pow(dis, 3) * xixk.y() * balance_parameter;
+						//grad[3 * i + 2] -= lambda2 * mu2 / pow(dis, 3) * xixk.z() * balance_parameter;
+
+						func			+= lambda2 * mu2 / pow(dis, 2) * balance_parameter;
+						grad[3 * i]		-= lambda2 * mu2 * 2 / pow(dis, 4) * xixk.x() * balance_parameter;
+						grad[3 * i + 1] -= lambda2 * mu2 * 2 / pow(dis, 4) * xixk.y() * balance_parameter;
+						grad[3 * i + 2] -= lambda2 * mu2 * 2 / pow(dis, 4) * xixk.z() * balance_parameter;
+					}
+					distance_terms.back() = distance_terms.back() + (func - tmp_f2);
+					tmp_g2 = Eigen::Vector3d(grad[3 * i], grad[3 * i + 1], grad[3 * i + 2]) - tmp_g2;
+					distance_grads.back() = distance_grads.back() + tmp_g2.norm();
+				}
+				tangent_grads.back() = tangent_grads.back() / feature_num;
+				distance_grads.back() = distance_grads.back() / feature_num;
+
+				// update decaying weight
+				lambda2 *= 0.99;
+				//lambda2 = exp(-double(func_calc_num) / 10);
+
+				// debug output
+				func_calc_num++;
+				if (func_calc_num % 5 == 0)
+				{
+					double grad_norm = 0;
+					for (int i = 0; i < feature_num; i++)
+					{
+						grad_norm += pow(grad[3 * i], 2);
+						grad_norm += pow(grad[3 * i + 1], 2);
+						grad_norm += pow(grad[3 * i + 2], 2);
+					}
+					cout << func_calc_num << ", func: " << func << ", n_grad: " << grad_norm << ", lambda2: " << lambda2 << endl;
+				}
+			};
+
+		// lbfgs
+		alglib::ae_int_t maxits = 0;
+		double epsg = 0;
+		double epsf = 1e-5;
+		double epsx = 0;
+		alglib::minlbfgsstate state;
+		alglib::minlbfgscreate(1, x, state);
+		alglib::minlbfgssetcond(state, epsg, epsf, epsx, maxits);
+		alglib::minlbfgssetscale(state, s);
+		alglib::minlbfgsreport rep;
+		alglib::minlbfgsoptimize(state, function_grad);
+		alglib::minlbfgsresults(state, x, rep);
+
+		for (int i = 0; i < feature_num; i++)
+		{
+			Eigen::Vector3d target(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+
+			/*
+			if ((offset_points[fea_2_ori[i]].cor - target).norm() > 5 * identify_search_radius)
+			{
+				offset_points[i].IsDelete = true;
+				offset_points[i].IsFeature = false;
+			}
+			else
+			{
+				offset_points[fea_2_ori[i]].cor = target;
+			}*/
+
+			offset_points[fea_2_ori[i]].cor = target;
+		}
+
+
+		// for test
+		/*
+		ofstream bout("..//data//4_balance_parameters.obj");
+		double min_balance = 999;
+		double max_balance = 0;
+		for (int i = 0; i < balance_parameter_arrays.size(); i++)
+		{
+			bout << "v " << x[3 * i] << " " << x[3 * i + 1] << " " << x[3 * i + 2] << " ";
+			bout << 255 * balance_parameter_arrays[i] << " " << 0 * balance_parameter_arrays[i] << " " << 0 * balance_parameter_arrays[i] << endl;
+
+			min_balance = min({ min_balance, balance_parameter_arrays[i] });
+			max_balance = max({ max_balance, balance_parameter_arrays[i] });
+		}
+		bout.close();
+		cout << "min: " << min_balance << endl;
+		cout << "max: " << max_balance << endl;*/
+		ofstream gout("..//data//4_grads.txt");
+		for (int i = 0; i < tangent_grads.size(); i++)
+		{
+			gout << i << ", " << tangent_grads[i] << ", " << distance_grads[i] << ", " << tangent_grads[i] / distance_grads[i] << endl;
+		}
+		gout.close();
+	}
+	// now 20240807
+	if (0)
+	{
+		// init
+		nanoflann::SearchParams params;
+		alglib::real_1d_array x;
+		x.setlength(3 * feature_num);
+		map<int, int> ori_2_fea;
+		map<int, int> fea_2_ori;
+		int fi = 0;
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsFeature)
+			{
+				x[3 * fi] = offset_points[i].cor.x();
+				x[3 * fi + 1] = offset_points[i].cor.y();
+				x[3 * fi + 2] = offset_points[i].cor.z();
+
+				ori_2_fea[i] = fi;
+				fea_2_ori[fi] = i;
+				fi++;
+			}
+		}
+		alglib::real_1d_array s;
+		s.setlength(3 * feature_num);
+		for (int i = 0; i < feature_num; i++)
+		{
+			s[3 * i] = 1;
+			s[3 * i + 1] = 1;
+			s[3 * i + 2] = 1;
+		}
+		int func_calc_num = 0;
+
+		// init func
+		std::function<void(const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)> function_grad
+			= [&](const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)
+			{
+				// init
+				func = 0.0;
+				for (int i = 0; i < feature_num; i++)
+				{
+					grad[3 * i] = 0.0;
+					grad[3 * i + 1] = 0.0;
+					grad[3 * i + 2] = 0.0;
+				}
+
+				// build feature points' kd tree
+				PointCloud<double> feature_cloud;
+				feature_cloud.pts.resize(feature_num);
+				for (int j = 0; j < feature_num; j++)
+				{
+					feature_cloud.pts[j].x = x[3 * j];
+					feature_cloud.pts[j].y = x[3 * j + 1];
+					feature_cloud.pts[j].z = x[3 * j + 2];
+				}
+				my_kd_tree_t   feature_index(3, feature_cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+				feature_index.buildIndex();
+
+				// calc func and grad
+				for (int i = 0; i < feature_num; i++)
+				{
+					// init
+					Eigen::Vector3d xi(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+					double query_pt[3] = { xi.x(), xi.y(), xi.z() };
+
+					// tangent plane cut (fixed neighborhood)
+					double tangent_func_tmp = 0;
+					Eigen::Vector3d tangent_grad_tmp(0, 0, 0);
+					for (int j = 0; j < Neighbors[fea_2_ori[i]].size(); j++)
+					{
+						Eigen::Vector3d xipj = xi - offset_points[Neighbors[fea_2_ori[i]][j]].cor;
+						double xipj_nj = xipj.dot(offset_points[Neighbors[fea_2_ori[i]][j]].nor);
+
+						tangent_func_tmp += pow(xipj_nj, 2);
+						tangent_grad_tmp += 2 * xipj_nj * offset_points[Neighbors[fea_2_ori[i]][j]].nor;
+					}
+
+					// get feature neighborhood
+					vector<std::pair<uint32_t, double>> ret_matches2;
+					const double search_radius2 = static_cast<double>(pow(identify_search_radius, 2));
+					const size_t nMatches2 = feature_index.radiusSearch(&query_pt[0], search_radius2, ret_matches2, params);
+
+					// distance
+					double distance_func_tmp = 0;
+					Eigen::Vector3d distance_grad_tmp(0, 0, 0);
+					for (int j = 0; j < nMatches2; j++)
+					{
+						if (ret_matches2[j].first == i)
+						{
+							continue;
+						}
+
+						Eigen::Vector3d xk(x[3 * ret_matches2[j].first], x[3 * ret_matches2[j].first + 1], x[3 * ret_matches2[j].first + 2]);
+						Eigen::Vector3d xixk = xi - xk;
+
+						double dis = xixk.norm();
+
+						distance_func_tmp += 1 / pow(dis, 2);
+						distance_grad_tmp -= 2 / pow(dis, 4) * xixk;
+					}
+
+					// update func and grad
+					double lambda;
+					if (distance_grad_tmp.norm() < 1e-16)
+					{
+						lambda = 0;
+					}
+					else
+					{
+						// lambda = 0.8 * tangent_grad_tmp.squaredNorm() / distance_grad_tmp.squaredNorm();
+						lambda = 0.8 * tangent_grad_tmp.norm() / distance_grad_tmp.norm();
+						// lambda = max(exp(-2 * pow(func_calc_num, 2) / 40000), 0.8) * tangent_grad_tmp.norm() / distance_grad_tmp.norm();
+					}
+
+					func			+= tangent_func_tmp ;
+					grad[3 * i]		+= tangent_grad_tmp.x();
+					grad[3 * i + 1] += tangent_grad_tmp.y();
+					grad[3 * i + 2] += tangent_grad_tmp.z();
+					func			+= lambda * distance_func_tmp;
+					grad[3 * i]		+= lambda * distance_grad_tmp.x();
+					grad[3 * i + 1] += lambda * distance_grad_tmp.y();
+					grad[3 * i + 2] += lambda * distance_grad_tmp.z();
+				}
+
+				// debug output
+				func_calc_num++;
+				if (func_calc_num % 5 == 0)
+				{
+					double grad_norm = 0;
+					for (int i = 0; i < feature_num; i++)
+					{
+						grad_norm += pow(grad[3 * i], 2);
+						grad_norm += pow(grad[3 * i + 1], 2);
+						grad_norm += pow(grad[3 * i + 2], 2);
+					}
+					cout << func_calc_num << ", func: " << func << ", n_grad: " << grad_norm << endl;
+				}
+			};
+
+		// lbfgs
+		alglib::ae_int_t maxits = 0;
+		double epsg = 0;
+		double epsf = 0;
+		double epsx = 0;
+		alglib::minlbfgsstate state;
+		alglib::minlbfgscreate(1, x, state);
+		alglib::minlbfgssetcond(state, epsg, epsf, epsx, maxits);
+		alglib::minlbfgssetscale(state, s);
+		alglib::minlbfgsreport rep;
+		alglib::minlbfgsoptimize(state, function_grad);
+		alglib::minlbfgsresults(state, x, rep);
+
+		for (int i = 0; i < feature_num; i++)
+		{
+			Eigen::Vector3d target(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+
+			/*
+			if ((offset_points[fea_2_ori[i]].cor - target).norm() > 5 * identify_search_radius)
+			{
+				offset_points[i].IsDelete = true;
+				offset_points[i].IsFeature = false;
+			}
+			else
+			{
+				offset_points[fea_2_ori[i]].cor = target;
+			}*/
+
+			offset_points[fea_2_ori[i]].cor = target;
+		}
+
+
+		// for test
+		/*
+		ofstream bout("..//data//4_balance_parameters.obj");
+		double min_balance = 999;
+		double max_balance = 0;
+		for (int i = 0; i < balance_parameter_arrays.size(); i++)
+		{
+			bout << "v " << x[3 * i] << " " << x[3 * i + 1] << " " << x[3 * i + 2] << " ";
+			bout << 255 * balance_parameter_arrays[i] << " " << 0 * balance_parameter_arrays[i] << " " << 0 * balance_parameter_arrays[i] << endl;
+
+			min_balance = min({ min_balance, balance_parameter_arrays[i] });
+			max_balance = max({ max_balance, balance_parameter_arrays[i] });
+		}
+		bout.close();
+		cout << "min: " << min_balance << endl;
+		cout << "max: " << max_balance << endl;*/
+		ofstream gout("..//data//4_grads.txt");
+		for (int i = 0; i < tangent_grads.size(); i++)
+		{
+			gout << i << ", " << tangent_grads[i] << ", " << distance_grads[i] << ", " << tangent_grads[i] / distance_grads[i] << endl;
+		}
+		gout.close();
+	}
+	// gradient descent
+	if (0)
+	{
+		// init
+		double initstepsize = 0.01;
+		double alpha = 1e-4;
+		double ratio = 0.25;
+		double mu = 0; // 1e-8
+		int iter = 0;
+		int max_iter = 500;
+		nanoflann::SearchParams params;
+		vector<double> cur_x(3 * feature_num, 0);
+		map<int, int> ori_2_fea;
+		map<int, int> fea_2_ori;
+		int fi = 0;
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsFeature)
+			{
+				cur_x[3 * fi] = offset_points[i].cor.x();
+				cur_x[3 * fi + 1] = offset_points[i].cor.y();
+				cur_x[3 * fi + 2] = offset_points[i].cor.z();
+				ori_2_fea[i] = fi;
+				fea_2_ori[fi] = i;
+				fi++;
+			}
+		}
+
+		// iterator
+		double ori_func = 0;
+		double stepsize = initstepsize;
+		while (iter < max_iter)
+		{
+			cout << "iter: " << iter << endl;
+
+			// build feture points' kd tree
+			PointCloud<double> feature_cloud;
+			feature_cloud.pts.resize(feature_num);
+			for (int j = 0; j < feature_num; j++)
+			{
+				feature_cloud.pts[j].x = cur_x[3 * j];
+				feature_cloud.pts[j].y = cur_x[3 * j + 1];
+				feature_cloud.pts[j].z = cur_x[3 * j + 2];
+			}
+			my_kd_tree_t   feature_index(3, feature_cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+			feature_index.buildIndex();
+
+			// get func and g
+			double func = 0;
+			vector<double> g(3 * feature_num, 0);
+			double term1_func = 0;
+			double term2_func = 0;
+			double term3_func = 0;
+			double term1_gnorm = 0;
+			double term2_gnorm = 0;
+			double term3_gnorm = 0;
+			for (int i = 0; i < offset_points.size(); i++)
+			{
+				if (offset_points[i].IsFeature)
+				{
+					Eigen::Vector3d xi(cur_x[3 * ori_2_fea[i]], cur_x[3 * ori_2_fea[i] + 1], cur_x[3 * ori_2_fea[i] + 2]);
+					double query_pt[3] = { xi.x(), xi.y(), xi.z() };
+
+					// tangent plane cut
+					vector<std::pair<uint32_t, double>> ret_matches;
+					const double search_radius = static_cast<double>(pow(identify_search_radius, 2));
+					const size_t nMatches = index.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+					double tmp_term1_func = func;
+					double tmp_term1_gnorm = pow(g[3 * ori_2_fea[i]], 2) + pow(g[3 * ori_2_fea[i] + 1], 2) + pow(g[3 * ori_2_fea[i] + 2], 2);
+					for (int j = 0; j < nMatches; j++)
+					{
+						Eigen::Vector3d zipj = xi - offset_points[ret_matches[j].first].cor;
+						double tmp = zipj.dot(offset_points[ret_matches[j].first].nor);
+
+						func += pow(tmp, 2);
+						g[3 * ori_2_fea[i]]		+= 2 * tmp * offset_points[ret_matches[j].first].nor.x();
+						g[3 * ori_2_fea[i] + 1] += 2 * tmp * offset_points[ret_matches[j].first].nor.y();
+						g[3 * ori_2_fea[i] + 2] += 2 * tmp * offset_points[ret_matches[j].first].nor.z();
+					}
+					tmp_term1_func = func - tmp_term1_func;
+					term1_func += tmp_term1_func;
+					tmp_term1_gnorm = pow(g[3 * ori_2_fea[i]], 2) + pow(g[3 * ori_2_fea[i] + 1], 2) + pow(g[3 * ori_2_fea[i] + 2], 2) - tmp_term1_gnorm;
+					term1_gnorm += tmp_term1_gnorm;
+
+					// fast tangent plane cut (for test)
+					/*for (int j = 0; j < Neighbors[i].size(); j++)
+					{
+						Eigen::Vector3d zipj = xi - offset_points[Neighbors[i][j]].cor;
+						double tmp = zipj.dot(offset_points[Neighbors[i][j]].nor);
+
+						func += pow(tmp, 2);
+						g[3 * ori_2_fea[i]]		+= 2 * tmp * offset_points[Neighbors[i][j]].nor.x();
+						g[3 * ori_2_fea[i] + 1] += 2 * tmp * offset_points[Neighbors[i][j]].nor.y();
+						g[3 * ori_2_fea[i] + 2] += 2 * tmp * offset_points[Neighbors[i][j]].nor.z();
+					}*/
+
+					// add closest condition
+					/*
+					double tmp_term2_func = func;
+					func += 0.001 * (xi - offset_points[i].cor).squaredNorm();
+					g[3 * ori_2_fea[i]]		+= 2 * 0.001 * (xi - offset_points[i].cor).x();
+					g[3 * ori_2_fea[i] + 1] += 2 * 0.001 * (xi - offset_points[i].cor).y();
+					g[3 * ori_2_fea[i] + 2] += 2 * 0.001 * (xi - offset_points[i].cor).z();
+					tmp_term2_func = func - tmp_term2_func;
+					term2_func += tmp_term2_func;*/
+
+					// get feature neighborhood
+					vector<std::pair<uint32_t, double>> ret_matches2;
+					const double search_radius2 = static_cast<double>(pow(identify_search_radius, 2));
+					const size_t nMatches2 = feature_index.radiusSearch(&query_pt[0], search_radius2, ret_matches2, params);
+
+					// calc PCA
+					double balance_parameter = 1;
+					/*
+					if (nMatches2 < 2)
+					{
+						balance_parameter = 0;
+					}
+					else
+					{
+						Eigen::Vector3d aveN({ 0, 0, 0 });
+						for (int j = 0; j < nMatches2; j++)
+						{
+							if (fea_2_ori[ret_matches2[j].first] == i) continue;
+							aveN = aveN + Eigen::Vector3d(feature_cloud.pts[ret_matches2[j].first].x, feature_cloud.pts[ret_matches2[j].first].y, feature_cloud.pts[ret_matches2[j].first].z);
+						}
+						aveN = aveN / nMatches2;
+						Eigen::MatrixXd covMat = Eigen::MatrixXd::Zero(3, 3);
+
+						for (int j = 0; j < nMatches2; j++)
+						{
+							if (fea_2_ori[ret_matches2[j].first] == i) continue;
+
+							Eigen::MatrixXd fp(3, 1);
+							fp << feature_cloud.pts[ret_matches2[j].first].x, feature_cloud.pts[ret_matches2[j].first].y, feature_cloud.pts[ret_matches2[j].first].z;
+
+
+							covMat = covMat + (fp * fp.transpose());
+						}
+						covMat = covMat / (nMatches2 - 1);
+
+						Eigen::JacobiSVD<Eigen::MatrixXd> svd(covMat, Eigen::ComputeFullU | Eigen::ComputeFullV);
+						double max_singular = max({ svd.singularValues()[0] , svd.singularValues()[1] , svd.singularValues()[2] });
+						balance_parameter = (sqrt(svd.singularValues()[0]) + sqrt(svd.singularValues()[1]) + sqrt(svd.singularValues()[2])) / sqrt(max_singular);
+					}*/
+
+					// distance
+					double tmp_term3_func = func;
+					double tmp_term3_gnorm = pow(g[3 * ori_2_fea[i]], 2) + pow(g[3 * ori_2_fea[i] + 1], 2) + pow(g[3 * ori_2_fea[i] + 2], 2);
+					for (int j = 0; j < nMatches2; j++)
+					{
+						if (fea_2_ori[ret_matches2[j].first] == i)
+						{
+							continue;
+						}
+
+						Eigen::Vector3d xk(feature_cloud.pts[ret_matches2[j].first].x, feature_cloud.pts[ret_matches2[j].first].y, feature_cloud.pts[ret_matches2[j].first].z);
+						Eigen::Vector3d xixk = xi - xk;
+						double dis = xixk.norm();
+
+						func += mu / (dis) * balance_parameter;
+						g[3 * ori_2_fea[i]]		-= mu / pow(dis, 3) * xixk.x() * balance_parameter;
+						g[3 * ori_2_fea[i] + 1] -= mu / pow(dis, 3) * xixk.y() * balance_parameter;
+						g[3 * ori_2_fea[i] + 2] -= mu / pow(dis, 3) * xixk.z() * balance_parameter;
+
+						//g[3 * ret_matches2[j].first]	 -= mu / pow(dis, 3) * xixk.x();
+						//g[3 * ret_matches2[j].first + 1] -= mu / pow(dis, 3) * xixk.y();
+						//g[3 * ret_matches2[j].first + 2] -= mu / pow(dis, 3) * xixk.z();
+					}
+					tmp_term3_func = func - tmp_term3_func;
+					term3_func += tmp_term3_func;
+					tmp_term3_gnorm = pow(g[3 * ori_2_fea[i]], 2) + pow(g[3 * ori_2_fea[i] + 1], 2) + pow(g[3 * ori_2_fea[i] + 2], 2) - tmp_term3_gnorm;
+					term3_gnorm += tmp_term3_gnorm;
+				}
+			}
+
+
+			// get g norm
+			double g_norm = 0;
+			for (int i = 0; i < g.size(); i++)
+			{
+				g_norm = g_norm + pow(g[i], 2);
+			}
+			cout << func << ", " << g_norm << endl;
+
+
+			// update x
+			for (int i = 0; i < cur_x.size(); i++)
+			{
+				cur_x[i] = cur_x[i] - initstepsize * g[i];
+			}
+			ori_func = func;
+			cout << "cur stepsize: " << stepsize << endl;
+			
+			// converage
+			if (g_norm < 1e-8)
+			{
+				break;
+			}
+			iter++;
+
+			cout << "term 1 func: " << term1_func << endl;
+			// cout << "term 2 func: " << term2_func << endl;
+			cout << "term 3 func: " << term3_func << endl;
+			cout << "term 1 gnorm: " << term1_gnorm << endl;
+			cout << "term 3 gnorm: " << term3_gnorm << endl;
+			cout << endl;
+		}
+
+		// renew
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsFeature)
+			{
+				if ((offset_points[i].cor - Eigen::Vector3d(cur_x[3 * ori_2_fea[i]], cur_x[3 * ori_2_fea[i] + 1], cur_x[3 * ori_2_fea[i] + 2])).norm() < 2 * identify_search_radius)
+				{
+					offset_points[i].cor.x() = cur_x[3 * ori_2_fea[i]];
+					offset_points[i].cor.y() = cur_x[3 * ori_2_fea[i] + 1];
+					offset_points[i].cor.z() = cur_x[3 * ori_2_fea[i] + 2];
+				}
+				else
+				{
+					offset_points[i].IsFeature = false;
+					offset_points[i].IsDelete = true;
+				}
+			}
+		}
+
+	}
+
+	// renew feature normals
+#pragma omp parallel for
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+
+		if (offset_points[i].IsFeature)
+		{
+			double query_pt[3] = { offset_points[i].cor.x(), offset_points[i].cor.y(), offset_points[i].cor.z() };
+			nanoflann::SearchParams params;
+			vector<std::pair<uint32_t, double>> ret_matches;
+			const double search_radius = static_cast<double>(pow(sample_par * Mesh.obbdiag, 2));
+			const size_t nMatches = index.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+
+			if (nMatches == 0) continue;
+
+			Eigen::Vector3d aveN(0, 0, 0);
+			for (int j = 0; j < nMatches; j++)
+			{
+				aveN = aveN + offset_points[ret_matches[j].first].nor;
+			}
+			aveN.normalize();
+
+			offset_points[i].nor = aveN;
+		}
+	}
+
+	// test output
+	if (1)
+	{
+		ofstream feature_points_out("..//data//4_Feature_Points_raw.obj");
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsDelete) continue;
+			if (!offset_points[i].IsFeature) continue;
+			feature_points_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << endl;
+		}
+		feature_points_out.close();
+
+		ofstream optimization_func_out("..//data//4_Optimization_Terms.csv");
+		for (int i = 0; i < tangent_terms.size(); i++)
+		{
+			optimization_func_out << i + 1 << ", " << tangent_terms[i] << ", " << distance_terms[i] << endl;
+		}
+		optimization_func_out.close();
+	}
+
+
+	// select PCA points
+
+
+
+	// optimize (reselect)
+	int RemainNum = 0;
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+		RemainNum++;
+	}
+	// init kd tree
+	map<int, int> cloud2points;
+	PointCloud<double> cloud2;
+	cloud2.pts.resize(RemainNum);
+	int cnt = 0;
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+		cloud2.pts[cnt].x = offset_points[i].cor[0];
+		cloud2.pts[cnt].y = offset_points[i].cor[1];
+		cloud2.pts[cnt].z = offset_points[i].cor[2];
+		cloud2points[cnt] = i;
+		cnt++;
+	}
+	my_kd_tree_t   index2(3 /*dim*/, cloud2, nanoflann::KDTreeSingleIndexAdaptorParams(10 /* max leaf */));
+	index2.buildIndex();
+	// boundary
+#pragma omp parallel for 
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+		if (!offset_points[i].IsBoundary) continue;
+
+		double query_pt[3] = { offset_points[i].cor.x(), offset_points[i].cor.y(), offset_points[i].cor.z() };
+		vector<std::pair<uint32_t, double>> ret_matches;
+		nanoflann::SearchParams params;
+		double search_radius;
+		search_radius = static_cast<double>(pow(3 * optimize_radius, 2));
+		
+		const size_t nMatches = index2.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+
+		if (nMatches > 1)
+		{
+			for (size_t j = 0; j < nMatches; j++)
+			{
+				int index = cloud2points[ret_matches[j].first];
+				if (!offset_points[index].IsBoundary)
+				{
+					offset_points[index].IsDelete = true;
+				}
+			}
+		}
+	}
+	// feature
+#pragma omp parallel for 
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+		if (!offset_points[i].IsFeature) continue;
+
+		double query_pt[3] = { offset_points[i].cor.x(), offset_points[i].cor.y(), offset_points[i].cor.z() };
+		vector<std::pair<uint32_t, double>> ret_matches;
+		nanoflann::SearchParams params;
+		double search_radius;
+		search_radius = static_cast<double>(pow(3 * optimize_radius, 2));
+
+		const size_t nMatches = index2.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+
+		if (nMatches > 1)
+		{
+			for (size_t j = 0; j < nMatches; j++)
+			{
+				int index = cloud2points[ret_matches[j].first];
+				if (!offset_points[index].IsBoundary && !offset_points[index].IsFeature)
+				{
+					offset_points[index].IsDelete = true;
+				}
+			}
+		}
+	}
+	// all
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+
+		double query_pt[3] = { offset_points[i].cor.x(), offset_points[i].cor.y(), offset_points[i].cor.z() };
+		vector<std::pair<uint32_t, double>> ret_matches;
+		nanoflann::SearchParams params;
+		double search_radius;
+		if (offset_points[i].IsFeature)
+		{
+			search_radius = static_cast<double>(pow(0.8 * optimize_radius, 2));
+		}
+		else
+		{
+			search_radius = static_cast<double>(pow(optimize_radius, 2));
+		}
+		const size_t nMatches = index2.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+
+		Eigen::Vector3d MergedPoint(0, 0, 0);
+		if (nMatches > 1)
+		{
+			for (size_t j = 0; j < nMatches; j++)
+			{
+				int index = cloud2points[ret_matches[j].first];
+				offset_points[index].IsDelete = true;
+				MergedPoint = MergedPoint + offset_points[index].cor;
+			}
+			offset_points[i].IsDelete = false;
+			MergedPoint = MergedPoint / nMatches;
+			offset_points[i].cor = MergedPoint;
+		}
+	}
+
+
+	// relocate
+#pragma omp parallel for
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+		if (!offset_points[i].IsFeature) continue;
+
+		AABB_Point query(offset_points[i].cor.x(), offset_points[i].cor.y(), offset_points[i].cor.z());
+
+		Point_and_primitive_id pp = Mesh.tree.closest_point_and_primitive(query);
+		AABB_Point cp = pp.first;
+		double qd = (cp - query).squared_length();
+
+		if (abs(qd - sq_offset) > EPS)
+		{
+			Eigen::Vector3d smooth_dir(query.x() - cp.x(), query.y() - cp.y(), query.z() - cp.z());
+			smooth_dir = smooth_dir.normalized();
+			AABB_Point target_p(cp.x() + smooth_dir.x() * abs(offset), cp.y() + smooth_dir.y() * abs(offset), cp.z() + smooth_dir.z() * abs(offset));
+			offset_points[i].cor.x() = target_p.x();
+			offset_points[i].cor.y() = target_p.y();
+			offset_points[i].cor.z() = target_p.z();
+		}
+	}
+
+
+	// done
+	tInfo.t_feature += time.time();
+
+
+	// DEBUG
+	if (DEBUG_MODE)
+	{
+		ofstream feature_points_out("..//data//4_Feature_Points.obj");
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsDelete) continue;
+			if (!offset_points[i].IsFeature) continue;
+			feature_points_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << endl;
+		}
+		feature_points_out.close();
+
+		ofstream final_points_out("..//data//4_Final_Offset_Points.obj");
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsDelete) continue;
+			final_points_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << endl;
+		}
+		final_points_out.close();
+
+		ofstream final_feature_normals_out("..//data//4_Feature_Point_Normals.obj");
+		int f_cnt = 0;
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsDelete) continue;
+			if (!offset_points[i].IsFeature) continue;
+			final_feature_normals_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << " " << "255 233 79" << endl;
+
+			Eigen::Vector3d np = offset_points[i].cor + 0.01 * offset_points[i].nor;
+			final_feature_normals_out << "v" << " " << np.x() << " " << np.y() << " " << np.z() << " " << "255 255 255" << endl;
+
+			final_feature_normals_out << "l" << " " << 2 * f_cnt + 1 << " " << 2 * f_cnt + 2 << endl;
+
+			f_cnt++;
+		}
+		final_feature_normals_out.close();
+
+		ofstream final_normals_out("..//data//4_Final_Offset_Normals.obj");
+		int p_cnt = 0;
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsDelete) continue;
+			final_normals_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << " " << "255 233 79" << endl;
+
+			Eigen::Vector3d np = offset_points[i].cor + 0.01 * offset_points[i].nor;
+			final_normals_out << "v" << " " << np.x() << " " << np.y() << " " << np.z() << " " << "255 255 255" << endl;
+
+			final_normals_out << "l" << " " << 2 * p_cnt + 1 << " " << 2 * p_cnt + 2 << endl;
+
+			p_cnt++;
+		}
+		final_normals_out.close();
+
+		ofstream offset_boundary_point_out("..//data//4_Final_Offset_Points_Boundary.obj");
+		vector <vector<int>> group_color;
+		for (int i = 0; i < Mesh.bloopnum; i++)
+		{
+			int color_r = (rand() % (255));
+			int color_g = (rand() % (255));
+			int color_b = (rand() % (255));
+			vector<int> group_rgb = { color_r, color_g, color_b };
+			group_color.push_back(group_rgb);
+		}
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsDelete) continue;
+
+			if (offset_points[i].IsBoundary && offset_points[i].BoundaryIndex != -1)
+			{
+				offset_boundary_point_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << " "
+					<< group_color[offset_points[i].BoundaryIndex][0] << " " << group_color[offset_points[i].BoundaryIndex][1] << " " << group_color[offset_points[i].BoundaryIndex][2] << endl;
+			}
+		}
+		offset_boundary_point_out.close();
+	}
+
+	return FEATURESUCCESS;
+}
+
+int Reconstruct(MeshInfo& Mesh, 
+	MeshInfo& resMesh,
+	std::vector<MyPoint>& offset_points,
+	TimeInfo& tInfo)
+{
+	// test RPD
+	/*
+	vector<Eigen::Vector3d> RPD_cors;
+	vector<Eigen::Vector3d> RPD_nors;
+	vector<bool> RPD_is_features;
+	vector<Eigen::Vector3i> output_faces;
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+
+		RPD_cors.push_back(offset_points[i].cor);
+		RPD_nors.push_back(offset_points[i].nor);
+		RPD_is_features.push_back(offset_points[i].IsFeature);
+	}
+	RPD::RPDRecon MyRPD(RPD_cors, RPD_nors, RPD_is_features);
+	MyRPD.set_radius(0.003 * Mesh.obbdiag);
+	MyRPD.set_feature_weight(1 * MyRPD.radius());
+	MyRPD.set_not_feature_weight(0 * MyRPD.radius());
+	// MyRPD.PoissonBasedReconstruction(output_faces);
+	MyRPD.ParallelDiskReconstruction(output_faces);
+	MyRPD.PrintTimeCount();
+	cout << endl;*/
+
+
+
+
+
+
+
+	int cur_p_num = 0;
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+		cur_p_num++;
+	}
+	if (cur_p_num < 3)
+	{
+		return RECONSTRUCTPOINTERROR;
+	}
+
+	// init needed file
+	ofstream out_p("pointcloud.obj");
+	ofstream out_pn("pointcloud_normal.txt");
+	ofstream out_f("feature.txt");
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+		out_p << "v" << " " << offset_points[i].cor[0] << " " << offset_points[i].cor[1] << " " << offset_points[i].cor[2] << endl;
+		out_pn << offset_points[i].nor[0] << " " << offset_points[i].nor[1] << " " << offset_points[i].nor[2] << endl;
+
+		if (offset_points[i].IsFeature)
+		{
+			out_f << "1" << endl;
+		}
+		else
+		{
+			out_f << "0" << endl;
+		}
+	}
+	out_p.close();
+	out_pn.close();
+	out_f.close();
+
+
+
+	// init
+	int numProcs = omp_get_num_procs();
+	omp_set_num_threads(2 * numProcs - 1);
+	CGAL::Timer time;
+
+	
+	// reconstruct
+	GeoBoxApplication co3neReconstruction;
+	co3neReconstruction.load("pointcloud.obj");
+	time.start();
+	co3neReconstruction.reconstruct_Co3Ne(10 * 0.003 * Mesh.obbdiag, 0, 30);
+	time.stop();
+	co3neReconstruction.save("pointcloud.obj");
+
+
+	// done
+	tInfo.t_reconstruct += time.time();
+	OpenMesh::IO::Options opt;
+	OpenMesh::IO::read_mesh(resMesh.mesh, "pointcloud.obj", opt);
+	resMesh.mesh.request_face_normals();
+	resMesh.mesh.update_normals();
+	resMesh.mesh.release_face_normals();
+	resMesh.mesh.garbage_collection();
+	remove("pointcloud.obj");
+	remove("pointcloud_normal.txt");
+	resMesh.sampledis = Mesh.sampledis;
+
+
+	// renew offset points
+	PointCloud<double> cloud;
+	cloud.pts.resize(resMesh.mesh.n_vertices());
+	for (int i = 0; i < resMesh.mesh.n_vertices(); i++)
+	{
+		MyMesh::Point p = resMesh.mesh.point(resMesh.mesh.vertex_handle(i));
+
+		cloud.pts[i].x = p[0];
+		cloud.pts[i].y = p[1];
+		cloud.pts[i].z = p[2];
+	}
+	my_kd_tree_t   index(3 /*dim*/, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10 /* max leaf */));
+	index.buildIndex();
+	vector<MyPoint> new_offset_points(resMesh.mesh.n_vertices());
+#pragma omp parallel for
+	for (int i = 0; i < offset_points.size(); i++)
+	{
+		if (offset_points[i].IsDelete) continue;
+		double query_pt[3] = { offset_points[i].cor[0], offset_points[i].cor[1], offset_points[i].cor[2] };
+		vector<std::pair<uint32_t, double>> ret_matches;
+		nanoflann::SearchParams params;
+		const double search_radius = static_cast<double>(pow(1e-6, 2));
+		const size_t nMatches = index.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+		if (nMatches > 0)
+		{
+			new_offset_points[ret_matches[0].first] = offset_points[i];
+		}
+	}
+	offset_points = new_offset_points;
+
+
+	// DEBUG
+	if (DEBUG_MODE)
+	{
+		co3neReconstruction.save("..//data//5_Reconstructed_Mesh.obj");
+
+		ofstream offset_boundary_point_out("..//data//5_Reconstructed_Mesh_Boundary.obj");
+		vector <vector<int>> group_color;
+		for (int i = 0; i < Mesh.bloopnum; i++)
+		{
+			int color_r = (rand() % (255));
+			int color_g = (rand() % (255));
+			int color_b = (rand() % (255));
+			vector<int> group_rgb = { color_r, color_g, color_b };
+			group_color.push_back(group_rgb);
+		}
+		for (int i = 0; i < offset_points.size(); i++)
+		{
+			if (offset_points[i].IsBoundary && offset_points[i].BoundaryIndex != -1)
+			{
+				offset_boundary_point_out << "v" << " " << offset_points[i].cor.x() << " " << offset_points[i].cor.y() << " " << offset_points[i].cor.z() << " "
+					<< group_color[offset_points[i].BoundaryIndex][0] << " " << group_color[offset_points[i].BoundaryIndex][1] << " " << group_color[offset_points[i].BoundaryIndex][2] << endl;
+			}
+		}
+		offset_boundary_point_out.close();
+	}
+
+	return RECONSTRUCTSUCCESS;
+}
+
+int Postprocess(MeshInfo& Mesh,
+	MeshInfo& resMesh,
+	std::vector<MyPoint>& offset_points,
+	double angle,
+	TimeInfo& tInfo)
+{
+	if (resMesh.mesh.n_faces() == 0)
+	{
+		return POSTPROCESSMESHERROR;
+	}
+
+	// init
+	int numProcs = omp_get_num_procs();
+	omp_set_num_threads(2 * numProcs - 1);
+	CGAL::Timer time;
+	time.start();
+	vector<bool> IsDelete(resMesh.mesh.n_faces(), false);
+	vector<Eigen::Vector3d> DeleteFaceNormal(resMesh.mesh.n_faces(), Eigen::Vector3d(0, 0, 0));
+	vector<Eigen::Vector3d> DeleteCheckPoint(resMesh.mesh.n_faces(), Eigen::Vector3d(0, 0, 0));
+	vector<Eigen::Vector3d> DeleteProjectPoint(resMesh.mesh.n_faces(), Eigen::Vector3d(0, 0, 0));
+	vector<int>				DeleteType(resMesh.mesh.n_faces(), -1); // this face deleted by what?
+	vector<double> DeleteProjectAngle(resMesh.mesh.n_faces(), -1);
+
+
+	// init ori mesh boundary
+	map<AABB_Point, bool> ori_boundary_vertex_map;
+	for (auto vi = Mesh.polyhedron.vertices_begin(); vi != Mesh.polyhedron.vertices_end(); vi++)
+	{
+		ori_boundary_vertex_map[vi->point()] = false;
+	}
+	for (auto vh = Mesh.polyhedron.halfedges_begin(); vh != Mesh.polyhedron.halfedges_end(); vh++)
+	{
+		if (vh->is_border())
+		{
+			AABB_Point vhp1 = vh->vertex()->point();
+			AABB_Point vhp2 = vh->next()->vertex()->point();
+			ori_boundary_vertex_map[vhp1] = true;
+			ori_boundary_vertex_map[vhp2] = true;
+		}
+	}
+
+
+	// check delete face
+#pragma omp parallel for
+	for (int i = 0; i < resMesh.mesh.n_faces(); i++)
+	{
+		MyMesh::FaceHandle fh = resMesh.mesh.face_handle(i);
+
+		vector<int> fp_idx;
+		for (MyMesh::FaceVertexIter fv_it = resMesh.mesh.fv_iter(fh); fv_it.is_valid(); ++fv_it)
+		{
+			fp_idx.push_back((*fv_it).idx());
+		}
+		if (fp_idx.size() != 3) continue;
+		int i1 = fp_idx[0];
+		int i2 = fp_idx[1];
+		int i3 = fp_idx[2];
+		MyMesh::Point fp1 = resMesh.mesh.point(resMesh.mesh.vertex_handle(i1)); // reconstructed mesh face point 1
+		MyMesh::Point fp2 = resMesh.mesh.point(resMesh.mesh.vertex_handle(i2)); // reconstructed mesh face point 2
+		MyMesh::Point fp3 = resMesh.mesh.point(resMesh.mesh.vertex_handle(i3)); // reconstructed mesh face point 3
+
+
+		// rule 0: the size of triangle
+		double maxl_ratio = 5;
+		if ((fp1 - fp2).norm() > maxl_ratio * resMesh.sampledis || (fp2 - fp3).norm() > maxl_ratio * resMesh.sampledis || (fp3 - fp1).norm() > maxl_ratio * resMesh.sampledis)
+		{
+			IsDelete[fh.idx()] = true;
+			DeleteType[fh.idx()] = 0;
+			continue;
+		}
+
+
+		if (!offset_points[i1].IsBoundary && !offset_points[i2].IsBoundary && !offset_points[i3].IsBoundary)
+		{
+			continue;
+		}
+
+
+		// rule 1: all points at boundary
+		if (offset_points[i1].IsBoundary && offset_points[i2].IsBoundary && offset_points[i3].IsBoundary)
+		{
+			if (offset_points[i1].BoundaryIndex == offset_points[i2].BoundaryIndex && offset_points[i2].BoundaryIndex == offset_points[i3].BoundaryIndex)
+			{
+				IsDelete[fh.idx()] = true;
+				DeleteType[fh.idx()] = 1;
+				continue;
+			}
+		}
+
+
+		// rule 2: projection
+		MyMesh::Point center = (fp1 + fp2 + fp3) / 3;
+
+		AABB_Point query(center[0], center[1], center[2]);
+		Point_and_primitive_id pp = Mesh.tree.closest_point_and_primitive(query);
+		AABB_Point cp = pp.first;					// the cloest point in ori mesh
+		Polyhedron::Face_handle cf = pp.second;		// the cloest face in ori mesh
+
+		AABB_Point cf_p1 = cf->halfedge()->vertex()->point();
+		AABB_Point cf_p2 = cf->halfedge()->next()->vertex()->point();
+		AABB_Point cf_p3 = cf->halfedge()->next()->next()->vertex()->point();
+		Eigen::Vector3d cp_to_cf_p1(cp.x() - cf_p1.x(), cp.y() - cf_p1.y(), cp.z() - cf_p1.z());
+		Eigen::Vector3d cp_to_cf_p2(cp.x() - cf_p2.x(), cp.y() - cf_p2.y(), cp.z() - cf_p2.z());
+		Eigen::Vector3d cp_to_cf_p3(cp.x() - cf_p3.x(), cp.y() - cf_p3.y(), cp.z() - cf_p3.z());
+		Eigen::Vector3d cf_l12((cf_p1 - cf_p2).x(), (cf_p1 - cf_p2).y(), (cf_p1 - cf_p2).z());
+		Eigen::Vector3d cf_l23((cf_p2 - cf_p3).x(), (cf_p2 - cf_p3).y(), (cf_p2 - cf_p3).z());
+		Eigen::Vector3d cf_l31((cf_p3 - cf_p1).x(), (cf_p3 - cf_p1).y(), (cf_p3 - cf_p1).z());
+		double dis_p1 = sqrt((cp - cf_p1).squared_length());
+		double dis_p2 = sqrt((cp - cf_p2).squared_length());
+		double dis_p3 = sqrt((cp - cf_p3).squared_length());
+		double dis_l12 = cp_to_cf_p1.cross(cf_l12).norm();
+		double dis_l23 = cp_to_cf_p2.cross(cf_l23).norm();
+		double dis_l31 = cp_to_cf_p3.cross(cf_l31).norm();
+
+		int cloest_type = 0; // cp at the cf's: 0 in the face; 1 at point1; 2 at point2; 3 at point3; 4 at edge12; 5 at edge23; 6 at edge31
+		if (dis_p1 < PRECIES_EPS)
+		{
+			cloest_type = 1;
+		}
+		else if (dis_p2 < PRECIES_EPS)
+		{
+			cloest_type = 2;
+		}
+		else if (dis_p3 < PRECIES_EPS)
+		{
+			cloest_type = 3;
+		}
+		else if (dis_l12 < PRECIES_EPS)
+		{
+			cloest_type = 4;
+		}
+		else if (dis_l23 < PRECIES_EPS)
+		{
+			cloest_type = 5;
+		}
+		else if (dis_l31 < PRECIES_EPS)
+		{
+			cloest_type = 6;
+		}
+
+		if (cloest_type == 0) continue;
+		if (cloest_type == 1 && !ori_boundary_vertex_map[cf_p1]) continue;
+		if (cloest_type == 2 && !ori_boundary_vertex_map[cf_p2]) continue;
+		if (cloest_type == 3 && !ori_boundary_vertex_map[cf_p3]) continue;
+		if (cloest_type == 4 && !cf->halfedge()->next()->is_border_edge()) continue;
+		if (cloest_type == 5 && !cf->halfedge()->next()->next()->is_border_edge()) continue;
+		if (cloest_type == 6 && !cf->halfedge()->is_border_edge()) continue;
+
+		Eigen::Vector3d project_vec((query - cp)[0], (query - cp)[1], (query - cp)[2]);
+		MyMesh::Normal tri_normal = (fp2 - fp1).cross(fp3 - fp2);
+		Eigen::Vector3d tri_normal_vec(tri_normal[0], tri_normal[1], tri_normal[2]);
+		project_vec.normalize();
+		tri_normal_vec.normalize();
+		double ProAngle = safetyAcos(project_vec.dot(tri_normal_vec));
+		if (ProAngle > 90)
+		{
+			ProAngle = 180 - ProAngle;
+		}
+
+		if (DEBUG_MODE)
+		{
+			DeleteFaceNormal[fh.idx()] = tri_normal_vec;
+			DeleteCheckPoint[fh.idx()] = Eigen::Vector3d(query.x(), query.y(), query.z());
+			DeleteProjectPoint[fh.idx()] = Eigen::Vector3d(cp.x(), cp.y(), cp.z());
+			DeleteProjectAngle[fh.idx()] = ProAngle;
+		}
+
+		if (ProAngle > angle && ProAngle < 90 - angle)
+		{
+			IsDelete[fh.idx()] = true;
+			DeleteType[fh.idx()] = 2;
+			// cout << cloest_type << endl;
+			continue;
+		}
+	}
+
+
+	// DEBUG
+	if (DEBUG_MODE)
+	{
+		time.stop();
+		ofstream delete_face_out1("..//data//6_Delete_Faces_01.obj");
+		ofstream delete_face_out("..//data//6_Delete_Faces_2.obj");
+		ofstream delete_process_out("..//data//6_Delete_Faces_Projection.obj");
+		int d_num = 0;
+		int d_num2 = 0;
+		for (int i = 0; i < resMesh.mesh.n_faces(); i++)
+		{
+			MyMesh::FaceHandle fh = resMesh.mesh.face_handle(i);
+
+			if (IsDelete[fh.idx()])
+			{
+				if (DeleteType[fh.idx()] == 2)
+				{
+					for (MyMesh::FaceVertexIter fv_it = resMesh.mesh.fv_iter(fh); fv_it.is_valid(); ++fv_it)
+					{
+						MyMesh::Point fv_it_p = resMesh.mesh.point(*fv_it);
+						delete_face_out << "v" << " " << fv_it_p[0] << " " << fv_it_p[1] << " " << fv_it_p[2] << endl;
+					}
+					delete_face_out << "f" << " " << 3 * d_num + 1 << " " << 3 * d_num + 2 << " " << 3 * d_num + 3 << endl;
+
+					delete_process_out << "v" << " " << DeleteCheckPoint[fh.idx()][0] << " " << DeleteCheckPoint[fh.idx()][1] << " " << DeleteCheckPoint[fh.idx()][2] << " " <<
+						"252" << " " << "233" << " " << "79" << endl;
+					delete_process_out << "v" << " " << DeleteProjectPoint[fh.idx()][0] << " " << DeleteProjectPoint[fh.idx()][1] << " " << DeleteProjectPoint[fh.idx()][2] << " " <<
+						"255" << " " << "0" << " " << "0" << endl;
+					delete_process_out << "v" << " " << (DeleteCheckPoint[fh.idx()] + 0.01 * DeleteFaceNormal[fh.idx()])[0] << " " << (DeleteCheckPoint[fh.idx()] + 0.01 * DeleteFaceNormal[fh.idx()])[1] << " " << (DeleteCheckPoint[fh.idx()] + 0.01 * DeleteFaceNormal[fh.idx()])[2] << " " <<
+						"0" << " " << "252" << " " << "59" << endl;
+					delete_process_out << "l" << " " << 3 * d_num + 1 << " " << 3 * d_num + 2 << endl;
+					delete_process_out << "l" << " " << 3 * d_num + 1 << " " << 3 * d_num + 3 << endl;
+
+					// cout << DeleteProjectAngle[fh.idx()] << endl;
+
+					d_num++;
+				}
+				else
+				{
+					for (MyMesh::FaceVertexIter fv_it = resMesh.mesh.fv_iter(fh); fv_it.is_valid(); ++fv_it)
+					{
+						MyMesh::Point fv_it_p = resMesh.mesh.point(*fv_it);
+						delete_face_out1 << "v" << " " << fv_it_p[0] << " " << fv_it_p[1] << " " << fv_it_p[2] << endl;
+					}
+					delete_face_out1 << "f" << " " << 3 * d_num2 + 1 << " " << 3 * d_num2 + 2 << " " << 3 * d_num2 + 3 << endl;
+					d_num2++;
+				}
+			}
+		}
+		delete_face_out1.close();
+		delete_face_out.close();
+		delete_process_out.close();
+		time.start();
+	}
+
+
+	// delete
+	int delete_num = 0;
+	resMesh.mesh.request_face_status();
+	resMesh.mesh.request_edge_status();
+	resMesh.mesh.request_vertex_status();
+	for (int i = 0; i < resMesh.mesh.n_faces(); i++)
+	{
+		MyMesh::FaceHandle fh = resMesh.mesh.face_handle(i);
+		if (IsDelete[fh.idx()])
+		{
+			resMesh.mesh.delete_face(fh);
+			delete_num++;
+		}
+	}
+	resMesh.mesh.garbage_collection();
+
+
+	// done
+	tInfo.t_postprocess += time.time();
+
+
+	// DEBUG
+	if (DEBUG_MODE)
+	{
+		saveMyMesh(resMesh, "..//data//6_Postprocess_Mesh.obj");
+	}
+
+	return POSTPROCESSSUCCESS;
+}

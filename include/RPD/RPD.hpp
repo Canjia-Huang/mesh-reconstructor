@@ -9,7 +9,7 @@
 #include <Eigen/Dense>
 
 namespace MeshReconstructorRPD {
-
+    
 }; // namespace RPD
 
 #endif

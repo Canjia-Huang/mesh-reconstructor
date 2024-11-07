@@ -6,7 +6,7 @@
 #include <Eigen/Dense>
 
 namespace MeshReconstructor {
-	class MESH_RECONSTRUCTOR_EXPORT Point {
+	class Point {
 	public:
 		Point() {
 			cor_ = Eigen::Vector3d(0, 0, 0);

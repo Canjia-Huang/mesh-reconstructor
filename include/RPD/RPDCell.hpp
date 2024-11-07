@@ -22,7 +22,7 @@ namespace MeshReconstructorRPD {
 		}
 	};
 
-	class MESH_RECONSTRUCTOR_EXPORT RPDCell {
+	class RPDCell {
 	public:
 		RPDCell() {
 			cor_ = Eigen::Vector3d(0, 0, 0);
@@ -31,12 +31,12 @@ namespace MeshReconstructorRPD {
 		~RPDCell() {
 			cor_ = Eigen::Vector3d(0, 0, 0);
 			(std::vector<RPDPlane>()).swap(cutted_planes_);
-			(std::vector<std::pair<Eigen::Vector3i, Point>>()).swap(cutted_vertices_);
+			(std::vector<std::pair<Eigen::Vector3i, Point> >()).swap(cutted_vertices_);
 		}
 
 		Eigen::Vector3d cor() const { return cor_; }
 		std::vector<RPDPlane>& cutted_planes() { return cutted_planes_; }
-		std::vector<std::pair<Eigen::Vector3i, Point>>& cutted_vertices() { return cutted_vertices_; }
+		std::vector<std::pair<Eigen::Vector3i, Point> >& cutted_vertices() { return cutted_vertices_; }
 
 		void init_cube(
 			Eigen::Vector3d& cor, 
@@ -64,7 +64,7 @@ namespace MeshReconstructorRPD {
 			// find cutted vertices
 			for (auto v_it = cutted_vertices_.begin(); v_it != cutted_vertices_.end();) {
 				if (plane.is_on_positive_side((*v_it).second.cor())) {
-					cutted_vertices.emplace_back((*v_it).first);
+					cutted_vertices.push_back((*v_it).first);
 					v_it = cutted_vertices_.erase(v_it);
 				}
 				else {
@@ -182,7 +182,7 @@ namespace MeshReconstructorRPD {
 	protected:
 		Eigen::Vector3d cor_;
 		std::vector<RPDPlane> cutted_planes_;
-		std::vector<std::pair<Eigen::Vector3i, Point>> cutted_vertices_;
+		std::vector<std::pair<Eigen::Vector3i, Point> > cutted_vertices_;
 	};
 }
 

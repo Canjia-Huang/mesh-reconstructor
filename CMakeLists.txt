@@ -1,13 +1,15 @@
-cmake_minimum_required (VERSION 3.8)
+cmake_minimum_required (VERSION 3.10)
 
-project("MeshReconstructor")
+set(CMAKE_TOOLCHAIN_FILE, "$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake")
+message(STATUS "CMAKE_TOOLCHAIN_FILE: ${CMAKE_TOOLCHAIN_FILE}")
 
-set(PUBLISH_BIN_DEBUG ${CMAKE_CURRENT_SOURCE_DIR}/build/bin/debug)
-set(PUBLISH_BIN_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/build/bin/release)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${PUBLISH_BIN_DEBUG})
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${PUBLISH_BIN_RELEASE})
+project(MeshReconstructor)
+
+set(CMAKE_BUILD_TYPE "Release")
+add_definitions(-DRPD_VERBOSE) # for test verbose
+
 add_compile_definitions(OUTPUT_PATH="${PROJECT_SOURCE_DIR}/data/")
-add_compile_options(/openmp:llvm)
+# add_compile_options(/openmp:llvm)
 
 # Eigen
 find_package(Eigen3 REQUIRED)
@@ -40,8 +42,6 @@ ENDIF()
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_SOURCE_DIR}/external)
 
-
-set(SRC_DIRS ${PROJECT_SOURCE_DIR}/src/RPD)
+set(SRC_DIRS ${PROJECT_SOURCE_DIR}/src)
 aux_source_directory(${SRC_DIRS} SRC_SOURCE)
 add_executable(MeshReconstructor ${SRC_SOURCE})
-

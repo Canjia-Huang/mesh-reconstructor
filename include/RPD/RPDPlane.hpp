@@ -6,7 +6,7 @@
 #include <Eigen/Dense>
 
 namespace MeshReconstructorRPD {
-	class MESH_RECONSTRUCTOR_EXPORT RPDPlane {
+	class RPDPlane {
 	public:
 		RPDPlane() {
 			a_ = 0;
