@@ -1,0 +1,395 @@
+#include "MeshOffset.h"
+
+#include <fstream>
+#include<iomanip>
+// CGAL orient
+#include <CGAL/Polygon_mesh_processing/orient_polygon_soup.h>
+
+namespace MeshOffsetStructure 
+{
+	TimeCount::TimeCount() {
+		time_duration_.clear();
+	}
+
+	void TimeCount::start() {
+		start_time_ = std::chrono::system_clock::now();
+	}
+
+	void TimeCount::stop() {
+		auto cur_time = std::chrono::system_clock::now();
+		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(cur_time - start_time_);
+		double duration_time = double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
+
+		time_duration_.push_back(duration_time);
+	}
+
+	void TimeCount::reset() {
+		time_duration_.clear();
+	}
+
+	void TimeCount::count_time(const std::string func_name) {
+		if (time_duration_.size() == 0) {
+			stop();
+		}
+
+		double total_time = 0;
+		for (int i = 0, i_end = time_duration_.size(); i < i_end; ++i) {
+			total_time += time_duration_[i];
+		}
+
+		time_pairs_.push_back(std::make_pair(func_name, total_time));
+
+		reset();
+	}
+
+	void TimeCount::cover_count_time(const std::string func_name) {
+		if (time_duration_.size() == 0) {
+			stop();
+		}
+
+		double total_time = 0;
+		for (int i = 0, i_end = time_duration_.size(); i < i_end; ++i) {
+			total_time += time_duration_[i];
+		}
+
+		time_pairs_.pop_back();
+		time_pairs_.push_back(std::make_pair(func_name, total_time));
+
+		reset();
+	}
+
+	void TimeCount::print_time_count() {
+		
+		double total_time = 0;
+
+		std::cout << "---------- TIME COUNT ----------" << std::endl;
+		for (int i = 0, i_end = time_pairs_.size(); i < i_end; ++i) {
+			std::cout << time_pairs_[i].first << ":" << std::endl;
+			for (int j = 0; j < indent_num_; j++) {
+				std::cout << "\t";
+			}
+			std::cout << std::fixed << "\033[33m" << time_pairs_[i].second << "\033[0m" << ".sec" << std::endl;
+
+			total_time += time_pairs_[i].second;
+		}
+
+		std::cout << "Total time:" << std::endl;
+		for (int j = 0; j < indent_num_; j++) {
+			std::cout << "\t";
+		}
+		std::cout << std::fixed << "\033[33m" << total_time << "\033[0m" << ".sec" << std::endl;
+
+		std::cout << "--------------------------------" << std::defaultfloat << std::endl;
+	}
+
+	// ---------- other functions ----------
+	int read_mesh(
+		const std::string file_path,
+		std::vector<Eigen::Vector3d>& points,
+		std::vector<Eigen::Vector3i>& faces
+	) {
+		DEBUG_ONLY_COUT("");
+
+		std::string back = file_path.substr(file_path.length() - 3, file_path.length());
+		if (back == "stl") { // .stl
+			std::vector<AABB_Point> s_points;
+			std::vector<std::array<int, 3> > s_triangles;
+			if (CGAL::IO::read_STL(file_path, s_points, s_triangles) == false) {
+				return 0;
+			}
+			CGAL::Polygon_mesh_processing::orient_polygon_soup(s_points, s_triangles);
+			//CGAL::Polygon_mesh_processing::polygon_soup_to_polygon_mesh(s_points, s_triangles, poly_Partition);
+
+			for (int i = 0; i < s_points.size(); i++) {
+				points.push_back(Eigen::Vector3d(s_points[i][0], s_points[i][1], s_points[i][2]));
+			}
+			for (int i = 0; i < s_triangles.size(); i++) {
+				faces.push_back(Eigen::Vector3i(s_triangles[i][0], s_triangles[i][1], s_triangles[i][2]));
+			}
+		}
+		else if (back == "off") { // .off
+			int vertex_num;
+			int face_num;
+			int edge_num;
+			int s;
+
+			std::ifstream in(file_path);
+			if (!in.good()) {
+				return 0;
+			}
+			do {
+				in.get();
+			} while (in.get() != '\n');
+
+			in >> vertex_num >> face_num >> edge_num;
+			for (int i = 0; i < vertex_num; i++) {
+				Eigen::Vector3d p;
+				in >> p.x() >> p.y() >> p.z();
+				points.push_back(p);
+			}
+			for (int i = 0; i < face_num; i++) {
+				Eigen::Vector3i f;
+				in >> s;
+				in >> f.x() >> f.y() >> f.z();
+				if (s == 3) {
+					faces.push_back(f);
+				}
+				else if (s == 4) {
+					int f4;
+					in >> f4;
+					faces.push_back(f);
+					faces.push_back(Eigen::Vector3i(f.z(), f4, f.x()));
+				}
+			}
+			in.close();
+		}
+		else { // .obj
+			std::ifstream in(file_path);
+			if (!in.good()) {
+				return 0;
+			}
+
+			std::string sline, s0;
+			std::string vertex_char = "v";
+			std::string face_char = "f";
+			while (getline(in, sline)) {
+				std::istringstream ins(sline);
+				ins >> s0;
+
+				if (s0 == vertex_char) {
+					//istringstream ins(sline);
+					Eigen::Vector3d p;
+					ins >> p.x() >> p.y() >> p.z();
+					// cout << p.x() << p.y() << p.z() << endl;
+					points.push_back(p);
+				}
+				else if (s0 == face_char) {
+					//istringstream ins(sline);
+					while (!ins.eof()) {
+						std::vector<std::string> s_v(3);
+						ins >> s_v[0] >> s_v[1] >> s_v[2];
+
+						// cout << s_v[0] << " " << s_v[1] << " " << s_v[2] << endl;
+						for (int i = 0; i < 3; i++) {
+							for (int j = 0; j < s_v[i].size(); j++) {
+								if (int(s_v[i][j]) == 47) {
+									s_v[i] = s_v[i].substr(0, j);
+									break;
+								}
+							}
+						}
+						// cout << s_v[0] << " " << s_v[1] << " " <<  s_v[2] << endl;
+
+						Eigen::Vector3i f;
+						std::istringstream(s_v[0]) >> f.x();
+						std::istringstream(s_v[1]) >> f.y();
+						std::istringstream(s_v[2]) >> f.z();
+						f.x() = f.x() - 1;
+						f.y() = f.y() - 1;
+						f.z() = f.z() - 1;
+						faces.push_back(f);
+
+						ins >> s0;
+						//cout << s0 << endl;
+
+						if (s0 == "f") {
+							break;
+						}
+						else if (s0 == "#") {
+							break;
+						}
+						else {
+							std::istringstream ss(s0);
+							int f4;
+							ss >> f4;
+							f4 = f4 - 1;
+
+							Eigen::Vector3i f1(f.z(), f4, f.x());
+							faces.push_back(f1);
+							break;
+						}
+					}
+				}
+			}
+			in.close();
+		}
+
+		return 1;
+
+		return 1;
+	}
+
+	int write_obj(
+		const std::string obj_path,
+		const std::vector<Eigen::Vector3d>& points,
+		const std::vector<Eigen::Vector3i>& faces
+	) {
+		DEBUG_ONLY_COUT("");
+
+		std::ofstream out(obj_path);
+		for (int i = 0; i < points.size(); i++) {
+			out << "v" << " " << points[i].transpose() << std::endl;
+		}
+		for (int i = 0; i < faces.size(); i++) {
+			out << "f" << " "
+				<< faces[i].x() + 1 << " "
+				<< faces[i].y() + 1 << " "
+				<< faces[i].z() + 1 << std::endl;
+		}
+		out.close();
+
+		return 1;
+	}
+
+	int write_OM_Mesh_to_obj(
+		const OM_Mesh& mesh,
+		const std::string& file_path) {
+		DEBUG_ONLY_COUT("");
+
+		if (mesh.n_faces() == 0){
+			DEBUG_ONLY_COUT("input file path is invalid!");
+			return 0;
+		}
+		if (file_path.length() < 4){
+			DEBUG_ONLY_COUT("input file path length < 4!");
+			return 0;
+		}
+
+		std::ofstream out(file_path);
+		for (int i = 0, i_end = mesh.n_vertices(); i < i_end; ++i){
+			OM_Mesh::Point p = mesh.point(mesh.vertex_handle(i));
+			out << "v" << " " << p[0] << " " << p[1] << " " << p[2] << std::endl;
+		}
+		for (int i = 0, i_end = mesh.n_faces(); i < i_end; ++i){
+			OM_Mesh::FaceHandle fh = mesh.face_handle(i);
+			std::vector<int> fp_idx;
+			for (OM_Mesh::FaceVertexIter fv_it = mesh.cfv_iter(fh); fv_it.is_valid(); ++fv_it){
+				fp_idx.push_back((*fv_it).idx());
+			}
+			if (fp_idx.size() != 3){
+				continue;
+			}
+			int a = fp_idx[0];
+			int b = fp_idx[1];
+			int c = fp_idx[2];
+
+			out << "f" << " " << a + 1 << " " << b + 1 << " " << c + 1 << std::endl;
+		}
+		out.close();
+
+		return 1;
+	}
+
+	void merge_points(
+		std::vector<Eigen::Vector3d>& points,
+		std::vector<Eigen::Vector3i>& faces,
+		const double eps
+	) {
+		DEBUG_ONLY_COUT("");
+
+		std::vector<int> merge_to(points.size(), -1);
+
+		// build kd tree
+		PointCloud<double> cloud;
+		cloud.pts.resize(points.size());
+		for (int i = 0, i_end = points.size(); i < i_end; ++i) {
+			cloud.pts[i].x = points[i].x();
+			cloud.pts[i].y = points[i].y();
+			cloud.pts[i].z = points[i].z();
+		}
+		my_kd_tree_t index(3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+		index.buildIndex();
+
+		// delete isolate
+		std::vector<bool> point_used(points.size(), false);
+		for (int i = 0, i_end = faces.size(); i < i_end; ++i) {
+			point_used[faces[i].x()] = true;
+			point_used[faces[i].y()] = true;
+			point_used[faces[i].z()] = true;
+		}
+
+		// find points that need to be merged
+		nanoflann::SearchParams params;
+		const double search_radius = static_cast<double>(eps * eps);
+		for (int i = 0, i_end = points.size(); i < i_end; ++i) {
+			if (merge_to[i] != -1) continue;
+
+			std::vector<std::pair<uint32_t, double>> ret_matches;
+			const size_t nMatches = index.radiusSearch(&points[i][0], search_radius, ret_matches, params);
+			for (int j = 0; j < nMatches; j++) {
+				merge_to[ret_matches[j].first] = i;
+			}
+		}
+
+		// renew
+		std::vector<Eigen::Vector3d> new_offset_points;
+		std::vector<Eigen::Vector3i> new_offset_faces;
+		std::unordered_map<int, int> old2new;
+		for (int i = 0, i_end = points.size(); i < i_end; ++i) {
+			if (point_used[i] == false || merge_to[i] != i) continue;
+
+			new_offset_points.push_back(points[i]);
+			old2new[i] = new_offset_points.size() - 1;
+		}
+
+		for (int i = 0, i_end = faces.size(); i < i_end; ++i) {
+			int P1 = faces[i][0];
+			int P2 = faces[i][1];
+			int P3 = faces[i][2];
+
+			int nP1 = old2new[merge_to[P1]];
+			int nP2 = old2new[merge_to[P2]];
+			int nP3 = old2new[merge_to[P3]];
+
+			if (nP1 == nP2 || nP2 == nP3 || nP3 == nP1) {
+				continue;
+			}
+
+			new_offset_faces.push_back(Eigen::Vector3i(nP1, nP2, nP3));
+		}
+
+		points.swap(new_offset_points);
+		faces.swap(new_offset_faces);
+	}
+
+	int orient_faces(
+		std::vector<Eigen::Vector3d>& points,
+		std::vector<Eigen::Vector3i>& faces
+	) {
+		DEBUG_ONLY_COUT("");
+
+		std::vector<AABB_Point> aabb_points;
+		std::vector<std::vector<std::size_t> > aabb_polygons;
+
+		aabb_points.reserve(points.size());
+		for (int i = 0, i_end = points.size(); i < i_end; ++i) {
+			aabb_points.emplace_back(AABB_Point(points[i].x(), points[i].y(), points[i].z()));
+		}
+
+		aabb_polygons.reserve(faces.size());
+		for (int i = 0, i_end = faces.size(); i < i_end; ++i) {
+			std::vector<std::size_t> polygon(3);
+			polygon[0] = faces[i].x();
+			polygon[1] = faces[i].y();
+			polygon[2] = faces[i].z();
+			aabb_polygons.emplace_back(polygon);
+		}
+
+		DEBUG_ONLY_COUT("Polygon_mesh_processing::orient_polygon_soup start");
+		if (CGAL::Polygon_mesh_processing::orient_polygon_soup(aabb_points, aabb_polygons) == false) {
+			return 0;
+		}
+		DEBUG_ONLY_COUT("Polygon_mesh_processing::orient_polygon_soup done");
+
+		std::vector<Eigen::Vector3d>(points.size()).swap(points);
+		for (int i = 0, i_end = aabb_points.size(); i < i_end; ++i) {
+			points[i] = Eigen::Vector3d(aabb_points[i].x(), aabb_points[i].y(), aabb_points[i].z());
+		}
+		std::vector<Eigen::Vector3i>(faces.size()).swap(faces);
+		for (int i = 0, i_end = aabb_polygons.size(); i < i_end; ++i) {
+			faces[i] = Eigen::Vector3i(aabb_polygons[i][0], aabb_polygons[i][1], aabb_polygons[i][2]);
+		}
+
+		return 1;
+	}
+} // namespace MeshOffsetStructure

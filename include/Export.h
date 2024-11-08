@@ -3,10 +3,10 @@
 
 #include <iostream>
 
-#ifdef RPD_VERBOSE
-#define RPD_DEBUG_ONLY(x) std::cout << x << std::endl;
+#ifdef DEBUG_VERBOSE
+#define DEBUG_ONLY_COUT(x) std::cout << __FUNCTION__ << " " << x << std::endl
 #else
-#define RPD_DEBUG_ONLY(x)
+#define DEBUG_ONLY_COUT(x)
 #endif
 
 #define MR_EPS 1e-12
