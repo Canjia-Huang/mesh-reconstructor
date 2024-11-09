@@ -1,14 +1,14 @@
 cmake_minimum_required (VERSION 3.10)
 
-set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_CXX_STANDARD_REQUIRED True)
-
 set(VCPKG_ROOT "$ENV{VCPKG_ROOT}")
 message(STATUS "VCPKG_ROOT: ${VCPKG_ROOT}")
 set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
 message(STATUS "CMAKE_TOOLCHAIN_FILE: ${CMAKE_TOOLCHAIN_FILE}")
 
 project(MeshReconstructor)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 set(CMAKE_BUILD_TYPE "Release")
 add_definitions(-DDEBUG_VERBOSE) # for test verbose

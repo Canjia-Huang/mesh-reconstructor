@@ -1,0 +1,4445 @@
+#include "MeshOffset.h"
+#include "RPD_Structure.hpp"
+
+#include <cmath>
+#include <iostream>
+#include <memory>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <climits>
+#include <cmath>
+#include <unordered_set>
+// alglib
+#include <alglib/stdafx.h>
+#include <alglib/optimization.h>
+#include <alglib/dataanalysis.h>
+// CGAL Regular Triangulation
+typedef Surface_mesh::Vertex_index		vertex_descriptor;
+typedef Surface_mesh::Face_index		face_descriptor;
+#include <CGAL/Regular_triangulation_vertex_base_3.h>
+typedef CGAL::Regular_triangulation_vertex_base_3<Kernel>				Vb0;
+#include <CGAL/Triangulation_vertex_base_with_info_3.h>
+typedef CGAL::Triangulation_vertex_base_with_info_3<int, Kernel, Vb0>	Vb;
+#include <CGAL/Regular_triangulation_cell_base_3.h>
+typedef CGAL::Regular_triangulation_cell_base_3<Kernel>					Cb;
+#include <CGAL/Triangulation_data_structure_3.h>
+typedef CGAL::Triangulation_data_structure_3<Vb, Cb>					Tds;
+#include <CGAL/Regular_triangulation_3.h>
+typedef CGAL::Regular_triangulation_3<Kernel, Tds>						Regular_triangulation;
+#include <CGAL/Weighted_point_3.h>
+typedef Kernel::Weighted_point_3	K_WPoint;
+typedef Kernel::Point_3				K_Point;
+// CGAL Poisson Reconstruction
+typedef Kernel::Vector_3				K_Vector;
+typedef std::pair<K_Point, K_Vector>	K_Pwn;
+#include <CGAL/Polyhedron_3.h>
+typedef CGAL::Polyhedron_3<Kernel>		Polyhedron;
+#include <CGAL/poisson_surface_reconstruction.h>
+// CGAL AABB Tree
+typedef Kernel::Segment_3				Segment;
+typedef Kernel::Triangle_3				Triangle;
+typedef std::list<Triangle>::iterator	AABB_Triangle_Iterator;
+#include <CGAL/AABB_triangle_primitive.h>
+typedef CGAL::AABB_triangle_primitive<Kernel, AABB_Triangle_Iterator>	AABB_Triangle_Primitive;
+typedef CGAL::AABB_traits<Kernel, AABB_Triangle_Primitive>				AABB_Triangle_traits;
+typedef CGAL::AABB_tree<AABB_Triangle_traits>							AABB_Triangle_Tree;
+// Geogram
+#include "MeshOffset_geogram.h"
+
+namespace MeshOffsetStructure 
+{
+	OffsetPoints::OffsetPoints() {
+	}
+
+	OffsetPoint& OffsetPoints::operator[](const int id) {
+		if (id < 0 || id >= offset_points_.size()) {
+			DEBUG_ONLY_COUT("index is invalid!");
+		}
+		return offset_points_[id];
+	}
+
+	void OffsetPoints::init_openmp() {
+		omp_set_dynamic(16);
+		num_procs_ = 2 * omp_get_num_procs() - 1;
+		omp_set_num_threads(num_procs_);
+	}
+
+	void OffsetPoints::set_mesh(
+		OffsetMesh& mesh
+	) {
+		mesh_ = &mesh;
+	}
+
+	void OffsetPoints::build_kd_tree_cloud() {
+		const int op_size = offset_points_.size();
+
+		if (op_size == 0) {
+			DEBUG_ONLY_COUT("offset point size is zero!");
+			return;
+		}
+
+		cloud_.pts.resize(op_size);
+		for (int i = 0; i < op_size; ++i) {
+			cloud_.pts[i].x = offset_points_[i].cor().x();
+			cloud_.pts[i].y = offset_points_[i].cor().y();
+			cloud_.pts[i].z = offset_points_[i].cor().z();
+		}
+	}
+
+	void OffsetPoints::build_kd_tree_remain_cloud() {
+		int rop_size = 0;
+		for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+			if (offset_points_[i].is_delete() == false) {
+				++rop_size;
+			}
+		}
+
+		if (rop_size == 0) {
+			DEBUG_ONLY_COUT("offset remain point size is zero!");
+			return;
+		}
+
+		remain_cloud_.pts.resize(rop_size);
+		int p_cnt = 0;
+		for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+			if (offset_points_[i].is_delete() == false) {
+				remain_cloud_.pts[p_cnt].x = offset_points_[i].cor().x();
+				remain_cloud_.pts[p_cnt].y = offset_points_[i].cor().y();
+				remain_cloud_.pts[p_cnt].z = offset_points_[i].cor().z();
+				++p_cnt;
+			}
+		}
+	}
+
+	bool OffsetPoints::is_kd_tree_cloud_valid() {
+		offset_points_size_ = offset_points_.size();
+		if (cloud_.kdtree_get_point_count() == offset_points_size_) {
+			return true;
+		}
+		return false;
+	}
+
+	const int OffsetPoints::count_remained_points() {
+		int nb_rp = 0;
+		for (int i = 0; i < offset_points_size_; ++i)
+		{
+			if (offset_points_[i].is_delete() == false) {
+				++nb_rp;
+			}
+		}
+		return nb_rp;
+	}
+
+	const double OffsetPoints::count_points_min_distance() {
+		build_kd_tree_remain_cloud();
+		my_kd_tree_t index(3, remain_cloud_, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+
+		double sq_min_dis = MAX;
+		for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+			if (offset_points_[i].is_delete() == false) {
+				std::vector<uint32_t> indices(2);
+				std::vector<double> distances(2);
+				index.knnSearch(
+					&offset_points_[i].cor()[0], 
+					2, 
+					&indices[0],
+					&distances[0]);
+				
+				sq_min_dis = std::min(sq_min_dis, distances[1]);
+			}
+		}
+
+		return sq_min_dis;
+	}
+
+	int OffsetPoints::check_points_valid(
+		const double range
+	) {
+		DEBUG_ONLY_COUT("");
+		bool is_valid = true;
+		for (int i = 0; i < offset_points_size_; ++i) {
+			if (offset_points_[i].cor().x() < -range || offset_points_[i].cor().x() > range || isnan(offset_points_[i].cor().x())) {
+				std::cout << "\033[31m" << "point cor x is invalid!" << " " << "idx(" << i << "):" << offset_points_[i].cor().x() << "\033[0m" << std::endl;
+				is_valid = false;
+			}
+			if (offset_points_[i].cor().y() < -range || offset_points_[i].cor().y() > range || isnan(offset_points_[i].cor().y())) {
+				std::cout << "\033[31m" << "point cor y is invalid!" << " " << "idx(" << i << "):" << offset_points_[i].cor().y() << "\033[0m" << std::endl;
+				is_valid = false;
+			}
+			if (offset_points_[i].cor().z() < -range || offset_points_[i].cor().z() > range || isnan(offset_points_[i].cor().z())) {
+				std::cout << "\033[31m" << "point cor z is invalid!" << " " << "idx(" << i << "):" << offset_points_[i].cor().z() << "\033[0m" << std::endl;
+				is_valid = false;
+			}
+
+			if (offset_points_[i].nor().x() < -range || offset_points_[i].nor().x() > range || isnan(offset_points_[i].nor().x())) {
+				std::cout << "\033[31m" << "point nor x is invalid!" << " " << "idx(" << i << "):" << offset_points_[i].nor().x() << "\033[0m" << std::endl;
+				is_valid = false;
+			}
+			if (offset_points_[i].nor().y() < -range || offset_points_[i].nor().y() > range || isnan(offset_points_[i].nor().y())) {
+				std::cout << "\033[31m" << "point nor y is invalid!" << " " << "idx(" << i << "):" << offset_points_[i].nor().y() << "\033[0m" << std::endl;
+				is_valid = false;
+			}
+			if (offset_points_[i].nor().z() < -range || offset_points_[i].nor().z() > range || isnan(offset_points_[i].nor().z())) {
+				std::cout << "\033[31m" << "point nor z is invalid!" << " " << "idx(" << i << "):" << offset_points_[i].nor().z() << "\033[0m" << std::endl;
+				is_valid = false;
+			}
+		}
+
+		if (is_valid)
+		{
+			return 1;
+		}
+		else
+		{
+			return 0;
+		}
+	}
+
+	int OffsetPoints::convert_to_mesh(
+		const std::vector<Eigen::Vector3i>& res_connection,
+		const std::vector<int>& res_connection_check,
+		OffsetMesh& res_mesh
+	) {
+		DEBUG_ONLY_COUT("");
+
+		if (res_connection.size() != res_connection_check.size()) {
+			DEBUG_ONLY_COUT("input vector size error!");
+			return 0;
+		}
+		if (res_connection.size() == 0 || res_connection_check.size() == 0) {
+			DEBUG_ONLY_COUT("input vector size invalid!");
+			return 0;
+		}
+
+		res_mesh = OffsetMesh();
+
+		// add vertex
+		std::vector<OM_Mesh::VertexHandle> offset_points_vh(offset_points_size_);
+		for (int i = 0; i < offset_points_size_; ++i) {
+			Eigen::Vector3d p_cor = offset_points_[i].cor();
+			offset_points_vh[i] = res_mesh.mesh().add_vertex(OM_Mesh::Point(p_cor.x(), p_cor.y(), p_cor.z()));
+		}
+
+		// add face
+		std::vector<OM_Mesh::VertexHandle> fh_array;
+		fh_array.reserve(3);
+		for (int i = 0, i_end = res_connection.size(); i < i_end; ++i) {
+			if (res_connection_check[i] == 0) {
+				fh_array.clear();
+				fh_array.push_back(offset_points_vh[res_connection[i].x()]);
+				fh_array.push_back(offset_points_vh[res_connection[i].y()]);
+				fh_array.push_back(offset_points_vh[res_connection[i].z()]);
+
+				res_mesh.mesh().add_face(fh_array);
+			}
+		}
+
+		return 1;
+	}
+
+	int OffsetPoints::generate_offset_points(
+		const double offset_dis,
+		const double sample_dis
+	) {
+		DEBUG_ONLY_COUT("");
+
+		// init
+#ifdef TIME_COUNT_GENERATE_OFFSET_POINTS
+		TimeCount TC;
+		TC.start();
+#endif
+		offset_points_.clear();
+		const OM_Mesh* mesh = &mesh_->mesh();
+		if (mesh->n_faces() == 0 || mesh->n_vertices() == 0) {
+			DEBUG_ONLY_COUT("input mesh is valid!");
+			return 0;
+		}
+		double sample_angle;
+		if (offset_dis == 0) {
+			sample_angle = 360;
+		}
+		else {
+			sample_angle = 2 * safetyAsin(sample_dis * edge_sample_ratio_ * 0.5 / abs(offset_dis));
+		}
+		if (sample_dis <= 0 || sample_angle <= 0) {
+			DEBUG_ONLY_COUT("input parameters are invalid!");
+			return 0;
+		}
+		if (num_procs_ == 0) {
+			init_openmp();
+		}
+		std::vector<std::vector<OffsetPoint>> offset_points_openmp;
+		for (int i = 0; i < num_procs_; ++i) {
+			std::vector<OffsetPoint> openmp_tmp;
+			openmp_tmp.reserve(1e5);
+			offset_points_openmp.push_back(openmp_tmp);
+		}
+
+#ifdef DEBUG_SERIAL_BOUNDARY_OFFSET_POINTS
+		// get boundary loop
+		if (mesh_->loops_index().size() == 0) {
+			mesh_->build_loops();
+		}
+#endif
+
+		// get face normals
+		if (mesh_->face_normals().size() == 0) {
+			mesh_->build_face_normals();
+		}
+
+		// get vertex normals
+		if (mesh_->vertex_normals().size() == 0) {
+			mesh_->build_vertex_normals();
+		}
+#ifdef TIME_COUNT_GENERATE_OFFSET_POINTS
+		TC.count_time("init");
+		TC.start();
+#endif
+
+		// offset edge and vertex
+		int vi_end = mesh->n_vertices();
+#pragma omp parallel for
+		for (int vi = 0; vi < vi_end; ++vi) {
+			OM_Mesh::VertexHandle vh = mesh->vertex_handle(vi);
+
+			Eigen::Vector3d point(mesh->point(vh)[0], mesh->point(vh)[1], mesh->point(vh)[2]);
+
+			// minimum/maximum adjacent edge length
+			double max_edge_length = -MAX;
+			double min_edge_length = MAX;
+			for (OM_Mesh::VertexIHalfedgeIter vih_it = mesh->cvih_iter(vh); vih_it.is_valid(); ++vih_it) {
+				OM_Mesh::VertexHandle f_vh = mesh->from_vertex_handle(*vih_it);
+				Eigen::Vector3d f_point(mesh->point(f_vh)[0], mesh->point(f_vh)[1], mesh->point(f_vh)[2]);
+
+				double length = (point - f_point).norm();
+
+				max_edge_length = std::max(max_edge_length, length);
+				min_edge_length = std::min(min_edge_length, length);
+			}
+			if (max_edge_length < 0 || min_edge_length >= MAX) {
+				continue;
+			}
+
+			// traverse adjacent halfedge
+			std::vector<Eigen::Vector3d> face_normals;
+			std::vector<Eigen::Vector3d> op_face_normals;
+			std::vector<bool> is_on_boundary;
+			for (OM_Mesh::VertexIHalfedgeIter vih_it = mesh->cvih_iter(vh); vih_it.is_valid(); ++vih_it) {
+				OM_Mesh::HalfedgeHandle heh = (*vih_it);
+				OM_Mesh::HalfedgeHandle heh_op = mesh->opposite_halfedge_handle(*vih_it);
+				OM_Mesh::Normal heh_vec_om = mesh->point(mesh->to_vertex_handle(heh)) - mesh->point(mesh->from_vertex_handle(heh));
+				Eigen::Vector3d heh_vec(heh_vec_om[0], heh_vec_om[1], heh_vec_om[2]);
+				double heh_vec_norm = heh_vec.norm();
+				if (heh_vec_norm < EPS) {
+					DEBUG_ONLY_COUT("heh_vec norm is zero!");
+					continue;
+				}
+
+				Eigen::Vector3d heh_unit_vec = heh_vec / heh_vec_norm;
+				
+				Eigen::Vector3d face_normal;
+				Eigen::Vector3d op_face_normal;
+				Eigen::Vector3d boundary_normal;
+				bool is_halfedge_on_boundary = false;
+				if (mesh->is_boundary(heh)) {
+					boundary_normal = mesh_->face_normals()[mesh->face_handle(heh_op).idx()];
+					is_halfedge_on_boundary = true;
+				}
+				else if (mesh->is_boundary(heh_op)) {
+					boundary_normal = mesh_->face_normals()[mesh->face_handle(heh).idx()];
+					is_halfedge_on_boundary = true;
+				}
+				else {
+					face_normal = mesh_->face_normals()[mesh->face_handle(heh).idx()];
+					op_face_normal = mesh_->face_normals()[mesh->face_handle(heh_op).idx()];
+				}
+
+				if (face_normal.norm() < EPS || op_face_normal.norm() < EPS) continue; // may contain nan face
+
+				// generate edge's multiple normal
+				std::vector<Eigen::Vector3d> edge_multiple_normals;
+				if (is_halfedge_on_boundary) {
+					edge_multiple_normals.push_back(boundary_normal);
+				}
+				else {
+					double rot_angle = safetyAcos(face_normal.dot(op_face_normal));
+					double rot_num = ceil(rot_angle / sample_angle);
+					rot_num = (rot_num < 2) ? 2 : rot_num;
+					double rot_angle_interval = rot_angle / rot_num;
+
+					// determine whether sampling is required
+					if (rot_angle < 179) {
+						Eigen::Vector3d face_normals_crossproduct = face_normal.cross(op_face_normal);
+						if (face_normals_crossproduct.dot(heh_vec) > 0) {
+							if (offset_dis < 0) {
+								continue;
+							}
+						}
+						else {
+							if (offset_dis > 0) {
+								continue;
+							}
+						}
+					}
+
+					// if the arc length is too small, the sampling will not be taken
+					if ((face_normal - op_face_normal).norm() * abs(offset_dis) < 0.5 * sample_dis) {
+						edge_multiple_normals.push_back((face_normal + op_face_normal).normalized());
+						continue;
+					}
+
+					for (double ang = 0; ang < rot_angle; ang += rot_angle_interval) {
+						edge_multiple_normals.push_back(Slerp(face_normal, sign(offset_dis) * heh_unit_vec, ang));
+					}
+					edge_multiple_normals.push_back(op_face_normal);
+				} // generate edge's multiple normal
+
+				// get ready for offsetting vertex
+				is_on_boundary.push_back(is_halfedge_on_boundary);
+				if (is_halfedge_on_boundary) {
+					if (mesh->is_boundary(heh)) {
+					}
+					else {
+					}
+					face_normals.push_back(boundary_normal);
+					op_face_normals.push_back(boundary_normal);
+				}
+				else {
+					face_normals.push_back(face_normal);
+					op_face_normals.push_back(op_face_normal);
+				}
+
+				// offset edge
+				if (is_offset_edge_) {
+					double sample_num = ceil(0.5 * heh_vec_norm / sample_dis);
+					if (sample_num < 1) {
+						sample_num = 1;
+					}
+					double edge_interval = 0.5 * heh_vec_norm / double(sample_num) * edge_sample_ratio_;
+					if (edge_interval <= 0) {
+						continue;
+					}
+
+					// boundary edge sampling setting
+					if (mesh->is_boundary(vh)) {
+						edge_interval *= 0.25;
+					}
+
+					// offset
+					double interlace = 0.5;
+					for (int i = 0, i_end = edge_multiple_normals.size(); i < i_end; ++i) {
+						Eigen::Vector3d tmp_p = point + offset_dis * edge_multiple_normals[i];
+
+						OffsetPoint op(tmp_p, sign(offset_dis) * edge_multiple_normals[i], false, is_halfedge_on_boundary, 1, heh.idx());
+#ifdef DEBUG_SERIAL_BOUNDARY_OFFSET_POINTS
+						if (mesh->is_boundary(heh)) {
+							op.boundary_idx() = mesh_->loops_index()[heh.idx()];
+						}
+						else if (mesh->is_boundary(heh_op)) {
+							op.boundary_idx() = mesh_->loops_index()[heh_op.idx()];
+						}
+#endif
+						offset_points_openmp[omp_get_thread_num()].push_back(op);
+						
+						// offset during halfedge
+						for (double space = interlace * edge_interval; space < 0.5 * heh_vec_norm; space += edge_interval) {
+							Eigen::Vector3d tmp_p2 = point - space * heh_unit_vec + offset_dis * edge_multiple_normals[i];
+
+							OffsetPoint op2(tmp_p2, sign(offset_dis) * edge_multiple_normals[i], false, is_halfedge_on_boundary, 1, heh.idx());
+#ifdef DEBUG_SERIAL_BOUNDARY_OFFSET_POINTS
+							if (mesh->is_boundary(heh)) {
+								op2.boundary_idx() = mesh_->loops_index()[heh.idx()];
+							}
+							else if (mesh->is_boundary(heh_op)) {
+								op2.boundary_idx() = mesh_->loops_index()[heh_op.idx()];
+							}
+#endif
+							offset_points_openmp[omp_get_thread_num()].push_back(op2);
+						}
+
+						interlace = (interlace == 0.5) ? 1 : 0.5;
+					}
+				}
+
+			} // traverse adjacent halfedge
+
+			// offset vertex
+			if (is_offset_vertex_) {
+				Eigen::Vector3d point_normal = mesh_->vertex_normals()[vh.idx()];
+				for (int i = 0, i_end = face_normals.size(); i < i_end; ++i) {
+					Eigen::Vector3d face_normal = face_normals[i];
+					Eigen::Vector3d op_face_normal = op_face_normals[i];
+
+					if ((face_normal - op_face_normal).norm() * abs(offset_dis) < sample_dis) {
+						continue;
+					}
+
+					if (is_on_boundary[i]) {
+						double rot_angle = safetyAcos(face_normal.dot(point_normal));
+						double rot_angle_interval = 0.5 * sample_angle * vertex_sample_ratio_;
+
+						Eigen::Vector3d fp_r = (face_normal.cross(point_normal)).normalized();
+						for (double ang = 0.5 * rot_angle_interval; ang < rot_angle; ang += rot_angle_interval) {
+							Eigen::Vector3d offset_normal = Slerp(face_normal, fp_r, ang);
+
+							OffsetPoint op(point + offset_dis * offset_normal, sign(offset_dis) * offset_normal, false, is_on_boundary[i], 0, vi);
+#ifdef DEBUG_SERIAL_BOUNDARY_OFFSET_POINTS
+							op.boundary_idx() = mesh_->loops_index()[hehs[i].idx()];
+#endif
+
+							offset_points_openmp[omp_get_thread_num()].push_back(op);
+						}
+					}
+					else {
+						double rot_face_angle = safetyAcos(face_normal.dot(point_normal));
+						double rot_op_face_angle = safetyAcos(op_face_normal.dot(point_normal));
+
+						double sample_face_num = ceil(rot_face_angle / sample_angle * vertex_sample_ratio_);
+						double sample_op_face_num = ceil(rot_op_face_angle / sample_angle * vertex_sample_ratio_);
+
+						if (sample_face_num < 1) {
+							sample_face_num = 1;
+						}
+						if (sample_op_face_num < 1) {
+							sample_op_face_num = 1;
+						}
+
+						double sample_face_angle_interval = rot_face_angle / sample_face_num;
+						double sample_op_face_angle_interval = rot_op_face_angle / sample_op_face_num;
+
+						Eigen::Vector3d fp_r = (point_normal.cross(face_normal)).normalized();
+						Eigen::Vector3d ofp_r = (point_normal.cross(op_face_normal)).normalized();
+						
+						while (rot_face_angle > 0 && rot_op_face_angle > 0) {
+							Eigen::Vector3d cur_face_normal = Slerp(point_normal, fp_r, rot_face_angle);
+							Eigen::Vector3d cur_op_face_normal = Slerp(point_normal, ofp_r, rot_op_face_angle);
+
+							double rot_normals_angle = safetyAcos(cur_face_normal.dot(cur_op_face_normal));
+							int sample_normals_num = rot_normals_angle / sample_angle * vertex_sample_ratio_;
+							double rot_normals_angle_interval = rot_normals_angle / double(sample_normals_num);
+
+							Eigen::Vector3d cfcof_r = (cur_face_normal.cross(cur_op_face_normal)).normalized();
+							for (double ang = 0.5 * rot_normals_angle_interval; ang < rot_normals_angle; ang += rot_normals_angle_interval) {
+								Eigen::Vector3d offset_normal = Slerp(cur_face_normal, cfcof_r, ang);
+
+								OffsetPoint op(point + offset_dis * offset_normal, sign(offset_dis) * offset_normal, false, is_on_boundary[i], 0, vi);
+
+								offset_points_openmp[omp_get_thread_num()].push_back(op);
+							}
+
+							rot_face_angle -= sample_face_angle_interval;
+							rot_op_face_angle -= sample_op_face_angle_interval;
+						}
+					}
+				}
+			}
+		} // process each vertex
+#ifdef TIME_COUNT_GENERATE_OFFSET_POINTS
+		TC.count_time("offset vertices and edges");
+		TC.start();
+#endif
+
+		// offset face
+		std::vector<OffsetPoint> offset_points_face;
+		if (is_offset_face_) {
+			if (1) { // poisson disk samaple
+				std::vector<Utils_sampling::Vec3> verts_vec3;
+				std::vector<Utils_sampling::Vec3> nors_vec3;
+				std::vector<int> tris;
+				verts_vec3.reserve(3 * mesh->n_faces());
+				nors_vec3.reserve(3 * mesh->n_faces());
+				tris.reserve(3 * mesh->n_faces());
+
+				int point_cnt = 0;
+				for (OM_Mesh::FaceIter f_it = mesh->faces_begin(); f_it != mesh->faces_end(); ++f_it) {
+					std::vector<OM_Mesh::Point> face_points;
+					for (auto fv_it = mesh->cfv_begin(*f_it); fv_it != mesh->cfv_end(*f_it); ++fv_it) {
+						face_points.push_back(mesh->point(*fv_it));
+					}
+
+					Eigen::Vector3d face_normal = mesh_->face_normals()[(*f_it).idx()];
+
+					for (int i = 0; i < face_points.size(); ++i) {
+						Utils_sampling::Vec3 point_vec3 = { face_points[i][0], face_points[i][1], face_points[i][2] };
+						verts_vec3.push_back(point_vec3);
+
+						Utils_sampling::Vec3 normal_vec3 = { face_normal.x(), face_normal.y(), face_normal.z() };
+						nors_vec3.push_back(normal_vec3);
+						tris.push_back(point_cnt++);
+					}
+				}
+
+				std::vector<Utils_sampling::Vec3> samples_pos_vec3;
+				std::vector<Utils_sampling::Vec3> samples_nor_vec3;
+				Utils_sampling::poisson_disk(sample_dis * face_sample_ratio_, 100, verts_vec3, nors_vec3, tris, samples_pos_vec3, samples_nor_vec3);
+
+				for (int i = 0, i_end = samples_pos_vec3.size(); i < i_end; ++i) {
+					Eigen::Vector3d point(samples_pos_vec3[i].x, samples_pos_vec3[i].y, samples_pos_vec3[i].z);
+					Eigen::Vector3d normal(samples_nor_vec3[i].x, samples_nor_vec3[i].y, samples_nor_vec3[i].z);
+
+					OffsetPoint op(point + offset_dis * normal, sign(offset_dis) * normal, false, false, 2, -1);
+
+					offset_points_face.push_back(op);
+				}
+			}
+			else if (0) { // uniform sample tris
+				for (OM_Mesh::FaceIter f_it = mesh->faces_begin(); f_it != mesh->faces_end(); ++f_it) {
+					std::vector<OM_Mesh::Point> face_points;
+					for (auto fv_it = mesh->cfv_begin(*f_it); fv_it != mesh->cfv_end(*f_it); ++fv_it) {
+						face_points.push_back(mesh->point(*fv_it));
+					}
+
+					Eigen::Vector3d face_normal = mesh_->face_normals()[(*f_it).idx()];
+
+					// not done yet...
+				}
+			}
+		}
+#ifdef TIME_COUNT_GENERATE_OFFSET_POINTS
+		TC.count_time("offset faces");
+		TC.start();
+#endif
+
+		// merge all points
+		for (int i = 0; i < num_procs_; ++i) {
+			offset_points_.insert(offset_points_.end(), offset_points_openmp[i].begin(), offset_points_openmp[i].end());
+		}
+		if (is_offset_face_) {
+			offset_points_.insert(offset_points_.end(), offset_points_face.begin(), offset_points_face.end());
+		}
+		offset_points_size_ = offset_points_.size();
+#ifdef TIME_COUNT_GENERATE_OFFSET_POINTS
+		TC.count_time("merge points");
+		TC.print_time_count();
+#endif
+		
+		return 1;
+	} // generate_offset_points
+
+	int OffsetPoints::generate_offset_points(
+		const double offset_dis,
+		const double sample_dis,
+		std::vector<Eigen::Vector3i>& res_connection
+	) {
+		DEBUG_ONLY_COUT("");
+
+		// init
+		offset_points_.clear();
+		res_connection.clear();
+		OM_Mesh* mesh = &mesh_->mesh();
+		if (mesh->n_faces() == 0 || mesh->n_vertices() == 0) {
+			DEBUG_ONLY_COUT("input mesh is valid!");
+			return 0;
+		}
+		double sample_angle;
+		if (offset_dis == 0) {
+			sample_angle = 360;
+		}
+		else {
+			sample_angle = 2 * safetyAsin(sample_dis * edge_sample_ratio_ * 0.5 / abs(offset_dis));
+		}
+		if (sample_dis <= 0 || sample_angle <= 0) {
+			DEBUG_ONLY_COUT("input parameters are invalid!");
+			return 0;
+		}
+		if (num_procs_ == 0) {
+			init_openmp();
+		}
+
+		// get boundary loop
+#ifdef DEBUG_SERIAL_BOUNDARY_OFFSET_POINTS
+		if (mesh_->loops_index().size() == 0) {
+			mesh_->build_loops();
+		}
+#endif
+
+		// get face normals
+		if (mesh_->face_normals().size() == 0) {
+			mesh_->build_face_normals();
+		}
+
+		// get vertex normals
+		if (mesh_->vertex_normals().size() == 0) {
+			mesh_->build_vertex_normals();
+		}
+		
+		// preprocess sample halfedge (at least two points)
+		int halfedge_num = mesh->n_halfedges();
+		std::vector<std::vector<Eigen::Vector3d>> halfedge_sample_points(halfedge_num);
+		for (int hi = 0; hi < halfedge_num; ++hi) {
+			if (halfedge_sample_points[hi].size() > 0) {
+				continue;
+			}
+
+			OM_Mesh::HalfedgeHandle heh = mesh->halfedge_handle(hi);
+			if (mesh->is_boundary(heh)) { // this halfedge is outside
+				continue;
+			}
+			OM_Mesh::HalfedgeHandle heh_op = mesh->opposite_halfedge_handle(heh);
+
+			OM_Mesh::VertexHandle heh_fvh = mesh->from_vertex_handle(heh);
+			OM_Mesh::VertexHandle heh_tvh = mesh->to_vertex_handle(heh);
+			OM_Mesh::Point heh_fvh_p = mesh->point(heh_fvh);
+			OM_Mesh::Point heh_tvh_p = mesh->point(heh_tvh);
+			Eigen::Vector3d heh_fvh_e_p(heh_fvh_p[0], heh_fvh_p[1], heh_fvh_p[2]);
+			Eigen::Vector3d heh_tvh_e_p(heh_tvh_p[0], heh_tvh_p[1], heh_tvh_p[2]);
+
+			double length = (heh_fvh_e_p - heh_tvh_e_p).norm();
+			double sample_num = ceil(length / sample_dis);
+			double edge_sample_ratio = (sample_dis > length) ? 1 : 1 / sample_num;
+
+			Eigen::Vector3d fv_to_tv_e_vec = heh_tvh_e_p - heh_fvh_e_p;
+
+			// enhance boundary
+			if (mesh->is_boundary(heh_op)) {
+				edge_sample_ratio *= 0.5;
+			}
+
+			// process halfedge
+			halfedge_sample_points[hi].push_back(heh_fvh_e_p);
+			for (double r = edge_sample_ratio; r < 1; r += edge_sample_ratio) {
+				Eigen::Vector3d sp = heh_fvh_e_p + r * fv_to_tv_e_vec;
+				halfedge_sample_points[hi].push_back(sp);
+			}
+			halfedge_sample_points[hi].push_back(heh_tvh_e_p);
+
+			// propress opposite halfedge
+			if (mesh->is_boundary(heh_op) == false) {
+				halfedge_sample_points[heh_op.idx()] = halfedge_sample_points[hi];
+				reverse(halfedge_sample_points[heh_op.idx()].begin(), halfedge_sample_points[heh_op.idx()].end());
+			}
+		}
+
+		// preprocess sample vertex by halfedge
+		std::vector<std::vector<Eigen::Vector3d>> halfedge_vertex_multiple_normals(halfedge_num);
+		for (int hi = 0; hi < halfedge_num; ++hi) {
+			OM_Mesh::HalfedgeHandle heh = mesh->halfedge_handle(hi);
+			if (halfedge_vertex_multiple_normals[heh.idx()].size() > 0) {
+				continue;
+			}
+			OM_Mesh::HalfedgeHandle heh_op = mesh->opposite_halfedge_handle(heh);
+			if (halfedge_vertex_multiple_normals[heh_op.idx()].size() > 0) {
+				continue;
+			}
+			OM_Mesh::Normal heh_vec_om = mesh->point(mesh->to_vertex_handle(heh)) - mesh->point(mesh->from_vertex_handle(heh));
+			Eigen::Vector3d heh_vec(heh_vec_om[0], heh_vec_om[1], heh_vec_om[2]);
+			Eigen::Vector3d heh_unit_vec = heh_vec.normalized();
+
+			if (mesh->is_boundary(heh) || mesh->is_boundary(heh_op)) {
+				continue;
+			}
+
+			Eigen::Vector3d face_normal;
+			Eigen::Vector3d op_face_normal;
+			face_normal = mesh_->face_normals()[mesh->face_handle(heh).idx()];
+			op_face_normal = mesh_->face_normals()[mesh->face_handle(heh_op).idx()];
+
+			double rot_angle = safetyAcos(face_normal.dot(op_face_normal));
+
+			// determine whether offset is required
+			if (rot_angle < 180 - OBS_EPS) { // sharp edge
+				Eigen::Vector3d face_normals_crossproduct = face_normal.cross(op_face_normal);
+				if (face_normals_crossproduct.dot(heh_vec) > 0) {
+					if (offset_dis < 0) {
+						continue;
+					}
+				}
+				else {
+					if (offset_dis > 0) {
+						continue;
+					}
+				}
+
+				double rot_num = ceil(rot_angle / sample_angle);
+				double rot_sample_ratio = (sample_angle > rot_angle) ? 1 : 1 / rot_num;
+
+				// generate multiple normals
+				halfedge_vertex_multiple_normals[hi].push_back(face_normal);
+				for (double r_ang = rot_sample_ratio; r_ang < 1; r_ang += rot_sample_ratio) {
+					Eigen::Vector3d slerp_vec = Slerp(face_normal, sign(offset_dis) * heh_unit_vec, r_ang * rot_angle);
+
+					halfedge_vertex_multiple_normals[hi].push_back(slerp_vec);
+				}
+				halfedge_vertex_multiple_normals[hi].push_back(op_face_normal);
+
+				// propress opposite halfedge
+				halfedge_vertex_multiple_normals[heh_op.idx()] = halfedge_vertex_multiple_normals[hi];
+				reverse(halfedge_vertex_multiple_normals[heh_op.idx()].begin(), halfedge_vertex_multiple_normals[heh_op.idx()].end());
+			}
+			else { // flat edge
+				continue;
+			}
+		}
+
+		// offset edge
+		std::vector<bool> halfedge_checked(halfedge_num, false);
+		for (int hi = 0; hi < halfedge_num; ++hi) {
+			OM_Mesh::HalfedgeHandle heh = mesh->halfedge_handle(hi);
+			if (halfedge_checked[heh.idx()]) {
+				continue;
+			}
+			else {
+				halfedge_checked[heh.idx()] = true;
+			}
+			OM_Mesh::HalfedgeHandle heh_op = mesh->opposite_halfedge_handle(heh);
+			if (halfedge_checked[heh_op.idx()]) {
+				continue;
+			}
+			else {
+				halfedge_checked[heh_op.idx()] = true;
+			}
+			
+			// result
+			std::vector<OffsetPoint> halfedge_offset_points;
+			std::vector<Eigen::Vector3i> halfedge_res_connection;
+
+			int nb_L = halfedge_sample_points[hi].size();
+			int nb_R = halfedge_vertex_multiple_normals[hi].size();
+			if (nb_L < 2 || nb_R == 0) {
+				continue;
+			}
+
+			// prepare for disturbance
+			Eigen::Vector3d distur_dir = halfedge_sample_points[hi][1] - halfedge_sample_points[hi][0];
+
+			// generate offset points
+			for (int i = 0; i < nb_R; ++i) {
+				for (int j = 0; j < nb_L; ++j) {
+					double distur_ratio;
+					if (i == 0 || i == nb_R - 1 || j == 0 || j == nb_L - 1) {
+						distur_ratio = 0;
+					}
+					else {
+						distur_ratio = (double(rand()) / RAND_MAX - 0.5) * 0.5;
+					}
+
+					OffsetPoint op(
+						halfedge_sample_points[hi][j] + distur_ratio * distur_dir + offset_dis * halfedge_vertex_multiple_normals[hi][i],
+						sign(offset_dis) * halfedge_vertex_multiple_normals[hi][i],
+						false,
+						false,
+						1,
+						hi);
+					halfedge_offset_points.push_back(op);
+				}
+			}
+
+			// generate connection
+			for (int i = 0; i < nb_R - 1; ++i) {
+				for (int j = 0; j < nb_L - 1; ++j) {
+					int v1 = nb_L * i + j;
+					int v2 = v1 + 1;
+					int v3 = v1 + nb_L;
+					int v4 = v3 + 1;
+					Eigen::Vector3i f1(v3, v2, v1);
+					Eigen::Vector3i f2(v2, v3, v4);
+					halfedge_res_connection.push_back(f1);
+					halfedge_res_connection.push_back(f2);
+				}
+			}
+
+			// renew
+			int cur_offset_points_cnt = offset_points_.size();
+			offset_points_.insert(offset_points_.end(), halfedge_offset_points.begin(), halfedge_offset_points.end());
+			for (int i = 0, i_end = halfedge_res_connection.size(); i < i_end; ++i) {
+				Eigen::Vector3i* f = &(halfedge_res_connection[i]);
+				f->x() += cur_offset_points_cnt;
+				f->y() += cur_offset_points_cnt;
+				f->z() += cur_offset_points_cnt;
+			}
+			res_connection.insert(res_connection.end(), halfedge_res_connection.begin(), halfedge_res_connection.end());
+		}
+
+		// offset face
+		int face_num = mesh->n_faces();
+		for (int fi = 0; fi < face_num; ++fi) {
+			OM_Mesh::FaceHandle fh = mesh->face_handle(fi);
+			Eigen::Vector3d fh_normal = mesh_->face_normals()[fi];
+
+			std::vector<OM_Mesh::HalfedgeHandle> f_hehs;
+			for (OM_Mesh::FaceHalfedgeIter fhi = mesh->fh_begin(fh); fhi != mesh->fh_end(fh); ++fhi) {
+				f_hehs.push_back(*fhi);
+			}
+
+			if (f_hehs.size() != 3) {
+				DEBUG_ONLY_COUT("face halfedge num is invalid!");
+				continue;
+			}
+
+			std::vector<Eigen::Vector3d>* h1_points = &halfedge_sample_points[f_hehs[0].idx()];
+			std::vector<Eigen::Vector3d>* h2_points = &halfedge_sample_points[f_hehs[1].idx()];
+			std::vector<Eigen::Vector3d>* h3_points = &halfedge_sample_points[f_hehs[2].idx()];
+
+			Eigen::Vector3d mid_point = ((*h1_points)[0] + (*h2_points)[0] + (*h3_points)[0]) / 3;
+
+			// offset
+			std::vector<OffsetPoint> face_offset_points;
+			std::vector<Eigen::Vector3i> face_res_connection;
+			int nb_h1 = (*h1_points).size();
+			int nb_h2 = (*h2_points).size();
+			int nb_h3 = (*h3_points).size();
+
+			OffsetPoint op(
+				mid_point + offset_dis * fh_normal,
+				sign(offset_dis) * fh_normal,
+				false,
+				false,
+				2,
+				fi);
+			face_offset_points.push_back(op);
+			for (int i = 0; i < nb_h1 - 1; ++i) {
+				OffsetPoint op(
+					(*h1_points)[i] + offset_dis * fh_normal,
+					sign(offset_dis) * fh_normal,
+					false,
+					false,
+					2,
+					fi);
+				face_offset_points.push_back(op);
+			}
+			for (int i = 0; i < nb_h2 - 1; ++i) {
+				OffsetPoint op(
+					(*h2_points)[i] + offset_dis * fh_normal,
+					sign(offset_dis) * fh_normal,
+					false,
+					false,
+					2,
+					fi);
+				face_offset_points.push_back(op);
+			}
+			for (int i = 0; i < nb_h3 - 1; ++i) {
+				OffsetPoint op(
+					(*h3_points)[i] + offset_dis * fh_normal,
+					sign(offset_dis) * fh_normal,
+					false,
+					false,
+					2,
+					fi);
+				face_offset_points.push_back(op);
+			}
+			for (int i = 0, i_end = nb_h1 + nb_h2 + nb_h3 - 4; i < i_end; ++i) {
+				face_res_connection.push_back(Eigen::Vector3i(
+					0,
+					i + 1,
+					i + 2));
+			}
+			face_res_connection.push_back(Eigen::Vector3i(
+				0,
+				nb_h1 + nb_h2 + nb_h3 - 3,
+				1));
+
+			// renew
+			int cur_offset_points_cnt = offset_points_.size();
+			offset_points_.insert(offset_points_.end(), face_offset_points.begin(), face_offset_points.end());
+			for (int i = 0, i_end = face_res_connection.size(); i < i_end; ++i) {
+				Eigen::Vector3i* f = &(face_res_connection[i]);
+				f->x() += cur_offset_points_cnt;
+				f->y() += cur_offset_points_cnt;
+				f->z() += cur_offset_points_cnt;
+			}
+			res_connection.insert(res_connection.end(), face_res_connection.begin(), face_res_connection.end());
+		}
+
+		// offset vertex
+		int vertex_num = mesh->n_vertices();
+		for (int vi = 0; vi < vertex_num; ++vi) {
+			OM_Mesh::VertexHandle vh = mesh->vertex_handle(vi);
+			OM_Mesh::Point vh_p = mesh->point(vh);
+			Eigen::Vector3d vh_e_p(vh_p[0], vh_p[1], vh_p[2]);
+			Eigen::Vector3d v_normal = mesh_->vertex_normals()[vi];
+
+			// collect all halfedge multiple normals
+			std::vector<Eigen::Vector3d> multiple_normals;
+			OM_Mesh::HalfedgeHandle vh_begin = (*mesh->vih_begin(vh));
+			OM_Mesh::HalfedgeHandle vh_cur = vh_begin;
+			while (1) {
+				std::vector<Eigen::Vector3d>* h_multiple_normals = &halfedge_vertex_multiple_normals[vh_cur.idx()];
+
+				if (h_multiple_normals->size() > 0) {
+					multiple_normals.insert(multiple_normals.end(), (*h_multiple_normals).begin(), (*h_multiple_normals).end() - 1);
+				}
+
+				vh_cur = mesh->prev_halfedge_handle(mesh->opposite_halfedge_handle(vh_cur));
+				if (vh_cur == vh_begin) {
+					break;
+				}
+			}
+			if (multiple_normals.size() < 1) {
+				continue;
+			}
+
+			// offset
+			std::vector<OffsetPoint> vertex_offset_points;
+			{ // center point
+				OffsetPoint op(
+					vh_e_p + offset_dis * v_normal,
+					sign(offset_dis) * v_normal,
+					false,
+					false,
+					0,
+					vi);
+				vertex_offset_points.push_back(op);
+			}
+			std::vector<int> slerp_num(multiple_normals.size(), 0);
+			for (int i = 0, i_end = multiple_normals.size(); i < i_end; ++i) {
+				double rot_angle = safetyAcos(v_normal.dot(multiple_normals[i]));
+				double rot_num = ceil(rot_angle / sample_angle);
+				double rot_sample_ratio = (rot_num < 1) ? 1 : 1 / rot_num;
+
+				Eigen::Vector3d rot_vec = (v_normal.cross(multiple_normals[i])).normalized();
+				for (double r_ang = rot_sample_ratio; r_ang < 1 + EPS; r_ang += rot_sample_ratio) {
+					Eigen::Vector3d slerp_vec = Slerp(v_normal, rot_vec, r_ang * rot_angle);
+
+					OffsetPoint op(
+						vh_e_p + offset_dis * slerp_vec,
+						sign(offset_dis) * slerp_vec,
+						false,
+						false,
+						0,
+						vi);
+					vertex_offset_points.push_back(op);
+
+					slerp_num[i]++;
+				}
+			}
+			slerp_num.push_back(slerp_num[0]);
+
+			// get connection
+			std::vector<Eigen::Vector3i> vertex_res_connection;
+			std::vector<int> slerp_num_sum(slerp_num.size(), 0);
+			for (int i = 1, i_end = slerp_num.size() - 1; i < i_end; ++i) {
+				slerp_num_sum[i] = slerp_num[i - 1] + slerp_num_sum[i - 1];
+			}
+			for (int i = 0, i_end = multiple_normals.size(); i < i_end; ++i) {
+				int cur_now_idx = 1;
+				int cur_next_idx = 1;
+				{
+					Eigen::Vector3i f(
+						0,
+						slerp_num_sum[i] + cur_now_idx,
+						slerp_num_sum[i + 1] + cur_next_idx);
+					vertex_res_connection.push_back(f);
+				}
+
+				while (cur_now_idx < slerp_num[i] || cur_next_idx < slerp_num[i + 1]) {
+					cur_now_idx++;
+					if (cur_now_idx <= slerp_num[i]) {
+						Eigen::Vector3i f(
+							slerp_num_sum[i + 1] + cur_next_idx,
+							slerp_num_sum[i] + cur_now_idx - 1,
+							slerp_num_sum[i] + cur_now_idx);
+						vertex_res_connection.push_back(f);
+					}
+					else {
+						cur_now_idx--;
+					}
+
+					cur_next_idx++;
+					if (cur_next_idx <= slerp_num[i + 1]) {
+						Eigen::Vector3i f(
+							slerp_num_sum[i + 1] + cur_next_idx - 1,
+							slerp_num_sum[i] + cur_now_idx,
+							slerp_num_sum[i + 1] + cur_next_idx);
+						vertex_res_connection.push_back(f);
+					}
+					else {
+						cur_next_idx--;
+					}
+
+					// cout << cur_now_idx << " " << slerp_num[i] << " " << cur_next_idx << " " << slerp_num[i + 1] << endl;
+				}
+			}
+
+			// renew
+			int cur_offset_points_cnt = offset_points_.size();
+			offset_points_.insert(offset_points_.end(), vertex_offset_points.begin(), vertex_offset_points.end());
+			for (int i = 0, i_end = vertex_res_connection.size(); i < i_end; ++i) {
+				Eigen::Vector3i* f = &(vertex_res_connection[i]);
+				f->x() += cur_offset_points_cnt;
+				f->y() += cur_offset_points_cnt;
+				f->z() += cur_offset_points_cnt;
+			}
+			res_connection.insert(res_connection.end(), vertex_res_connection.begin(), vertex_res_connection.end());
+		}
+
+		offset_points_size_ = offset_points_.size();
+
+		return 1;
+	}
+
+	int OffsetPoints::filter_close_points(
+		const double search_radis,
+		const int search_range,
+		const int process_range
+	) {
+		DEBUG_ONLY_COUT("");
+		srand(0);
+
+		if (search_range < -3 || search_range > 3){
+			DEBUG_ONLY_COUT("input search_range invalid!");
+			return 0;
+		}
+		if (process_range < -3 || process_range > 3){
+			DEBUG_ONLY_COUT("input process_range invalid!");
+			return 0;
+		}
+
+		build_kd_tree_cloud();
+
+		nanoflann::SearchParams params;
+		const double search_radius = search_radis * search_radis;
+		my_kd_tree_t index(3, cloud_, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+		for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+			if (offset_points_[i].is_delete() == true) continue;
+
+			bool is_continue_0 = false;
+			switch (search_range) {
+			case 0:
+				break;
+			case -1:
+				if (offset_points_[i].is_feature() == true) {
+					is_continue_0 = true;
+				}
+				break;
+			case -2:
+				if (offset_points_[i].is_boundary() == true) {
+					is_continue_0 = true;
+				}
+				break;
+			case -3:
+				if (offset_points_[i].is_feature() == true || offset_points_[i].is_boundary() == true) {
+					is_continue_0 = true;
+				}
+				break;
+			case 1:
+				if (offset_points_[i].is_feature() == false) {
+					is_continue_0 = true;
+				}
+				break;
+			case 2:
+				if (offset_points_[i].is_boundary() == false) {
+					is_continue_0 = true;
+				}
+				break;
+			case 3:
+				if (offset_points_[i].is_feature() == false && offset_points_[i].is_boundary() == false) {
+					is_continue_0 = true;
+				}
+				break;
+			}
+			if (is_continue_0) continue;
+
+			vector<std::pair<uint32_t, double>> ret_matches;
+			const size_t nMatches = index.radiusSearch(&offset_points_[i].cor()[0], search_radius, ret_matches, params);
+
+			if (nMatches > 1) {
+				// Eigen::Vector3d merged_cor = offset_points_[i].cor();
+				// int cur_nMatches = 1;
+
+				for (int j = 1; j < nMatches; ++j) {
+					const int ret_j = ret_matches[j].first;
+
+					if (offset_points_[ret_j].is_delete() == true) {
+						continue;
+					}
+
+					bool is_continue_1 = false;
+					switch (process_range) {
+					case 0:
+						break;
+					case -1:
+						if (offset_points_[ret_j].is_feature() == true) {
+							is_continue_1 = true;
+						}
+						break;
+					case -2:
+						if (offset_points_[ret_j].is_boundary() == true) {
+							is_continue_1 = true;
+						}
+						break;
+					case -3:
+						if (offset_points_[ret_j].is_feature() == true || offset_points_[ret_j].is_boundary() == true) {
+							is_continue_1 = true;
+						}
+						break;
+					case 1:
+						if (offset_points_[ret_j].is_feature() == false) {
+							is_continue_1 = true;
+						}
+						break;
+					case 2:
+						if (offset_points_[ret_j].is_boundary() == false) {
+							is_continue_1 = true;
+						}
+						break;
+					case 3:
+						if (offset_points_[ret_j].is_feature() == false && offset_points_[ret_j].is_boundary() == false) {
+							is_continue_1 = true;
+						}
+						break;
+					}
+					if (is_continue_1) {
+						continue;
+					}
+
+					offset_points_[ret_j].delete_type() = 1;
+
+					// merged_cor += offset_points_[ret_j].cor();
+					// ++cur_nMatches;
+				}
+
+				// merged_cor /= cur_nMatches;
+				// offset_points_[i].cor() = merged_cor;
+			}
+		}
+
+		return 1;
+	}
+
+	int OffsetPoints::merge_close_points(
+		const double search_radis,
+		const int search_range,
+		const int process_range,
+		std::vector<Eigen::Vector3i>& res_connection) {
+		DEBUG_ONLY_COUT("");
+
+		if (search_range < -3 || search_range > 3) {
+			DEBUG_ONLY_COUT("input search_range invalid!");
+			return 0;
+		}
+		if (process_range < -3 || process_range > 3) {
+			DEBUG_ONLY_COUT("input process_range invalid!");
+			return 0;
+		}
+
+		build_kd_tree_cloud();
+
+		std::vector<int> origin_to_merged_idx(offset_points_.size());
+		for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+			origin_to_merged_idx[i] = i;
+		}
+		my_kd_tree_t index(3, cloud_, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+		for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+			if (offset_points_[i].is_delete() == false) {
+				bool is_continue_0 = false;
+				switch (search_range) {
+				case 0:
+					break;
+				case -1:
+					if (offset_points_[i].is_feature() == true) {
+						is_continue_0 = true;
+					}
+					break;
+				case -2:
+					if (offset_points_[i].is_boundary() == true) {
+						is_continue_0 = true;
+					}
+					break;
+				case -3:
+					if (offset_points_[i].is_feature() == true || offset_points_[i].is_boundary() == true) {
+						is_continue_0 = true;
+					}
+					break;
+				case 1:
+					if (offset_points_[i].is_feature() == false) {
+						is_continue_0 = true;
+					}
+					break;
+				case 2:
+					if (offset_points_[i].is_boundary() == false) {
+						is_continue_0 = true;
+					}
+					break;
+				case 3:
+					if (offset_points_[i].is_feature() == false && offset_points_[i].is_boundary() == false) {
+						is_continue_0 = true;
+					}
+					break;
+				}
+				if (is_continue_0) continue;
+
+				Eigen::Vector3d query_pt = offset_points_[i].cor();
+
+				vector<std::pair<uint32_t, double>> ret_matches;
+				nanoflann::SearchParams params;
+				const double search_radius = static_cast<double>(search_radis * search_radis);
+				const size_t nMatches = index.radiusSearch(&query_pt[0], search_radius, ret_matches, params);
+
+				if (nMatches > 1) {
+					for (int j = 0; j < nMatches; ++j) {
+						bool is_continue_1 = false;
+						switch (process_range) {
+						case 0:
+							break;
+						case -1:
+							if (offset_points_[ret_matches[j].first].is_feature() == true) {
+								is_continue_1 = true;
+							}
+							break;
+						case -2:
+							if (offset_points_[ret_matches[j].first].is_boundary() == true) {
+								is_continue_1 = true;
+							}
+							break;
+						case -3:
+							if (offset_points_[ret_matches[j].first].is_feature() == true || offset_points_[ret_matches[j].first].is_boundary() == true) {
+								is_continue_1 = true;
+							}
+							break;
+						case 1:
+							if (offset_points_[ret_matches[j].first].is_feature() == false) {
+								is_continue_1 = true;
+							}
+							break;
+						case 2:
+							if (offset_points_[ret_matches[j].first].is_boundary() == false) {
+								is_continue_1 = true;
+							}
+							break;
+						case 3:
+							if (offset_points_[ret_matches[j].first].is_feature() == false && offset_points_[ret_matches[j].first].is_boundary() == false) {
+								is_continue_1 = true;
+							}
+							break;
+						}
+						if (is_continue_1) continue;
+
+						// if (ret_matches[j].first > -1 && ret_matches[j].first < offset_points_size_) 
+						{
+							offset_points_[ret_matches[j].first].delete_type() = 1;
+							origin_to_merged_idx[ret_matches[j].first] = i;
+						}
+					}
+					offset_points_[i].delete_type() = 0;
+					origin_to_merged_idx[i] = i;
+				}
+			}
+		}
+
+		for (int i = 0, i_end = res_connection.size(); i < i_end; ++i) {
+			res_connection[i].x() = origin_to_merged_idx[res_connection[i].x()];
+			res_connection[i].y() = origin_to_merged_idx[res_connection[i].y()];
+			res_connection[i].z() = origin_to_merged_idx[res_connection[i].z()];
+		}
+
+		return 1;
+	}
+
+	int OffsetPoints::filter_offset_points(
+		const double offset_dis,
+		const double eps
+	) {
+		DEBUG_ONLY_COUT("");
+
+#ifdef TIME_COUNT_FILTER_OFFSET_POINTS
+		TimeCount TC;
+		TC.start();
+#endif
+		const OM_Mesh& mesh = mesh_->mesh();
+		double squared_offset = offset_dis * offset_dis;
+
+		if (mesh_->is_aabb_tree_valid() == false) {
+			mesh_->build_aabb_tree();
+		}
+#ifdef TIME_COUNT_FILTER_OFFSET_POINTS
+		TC.count_time("init and build aabb tree");
+		TC.start();
+#endif
+
+#pragma omp parallel for
+		for (int i = 0; i < offset_points_size_; ++i) {
+			if (offset_points_[i].is_delete() == false) {
+
+				const AABB_Point query(offset_points_[i].cor().x(), offset_points_[i].cor().y(), offset_points_[i].cor().z());
+				double sqd = mesh_->aabb_tree().squared_distance(query);
+				double qd = sqrt(sqd);
+
+				// if (abs(sqd - squared_offset) > aabb_tree_eps_-4)
+				if (abs(qd - abs(offset_dis)) > eps) {
+					offset_points_[i].delete_type() = 2;
+				}
+			}
+		}
+
+#ifdef TIME_COUNT_FILTER_OFFSET_POINTS
+		TC.count_time("filter points");
+		TC.print_time_count();
+#endif
+
+		return 1;
+	} // filter_offset_points
+
+	int OffsetPoints::generate_feature_points(
+		const double offset_dis,
+		const double sample_dis,
+		const double identify_ratio,
+		const double neigh_search_ratio,
+		const double min_angle,
+		const double max_angle
+	) {
+		DEBUG_ONLY_COUT("");
+		srand(0);
+
+		// init
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+		TimeCount TC;
+		TC.start();
+#endif
+		double identify_radis = identify_ratio * sample_dis;
+		double neigh_search_radis = neigh_search_ratio * sample_dis;
+		offset_points_size_ = offset_points_.size();
+		build_kd_tree_cloud();
+		nanoflann::SearchParams params;
+		my_kd_tree_t index(3, cloud_, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+		TC.count_time("init and build kd tree");
+		TC.start();
+#endif
+
+		// identify potential feature points
+		std::vector<std::vector<int>> offset_points_neighbors(offset_points_size_);
+		{
+			const double search_radius = static_cast<double>(identify_radis * identify_radis);
+#pragma omp parallel for
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_delete() == true || 
+					offset_points_[i].is_boundary() == true) continue;
+
+				vector<std::pair<uint32_t, double>> ret_matches;
+				const size_t nMatches = index.radiusSearch(&offset_points_[i].cor()[0], search_radius, ret_matches, params);
+
+				int deleted_num = 0;
+				for (int j = 0; j < nMatches; j++) {
+					if (offset_points_[ret_matches[j].first].delete_type() == 2) {
+						++deleted_num;
+					}
+				}
+
+				if (abs(double(deleted_num) / double(nMatches) - 0.5) < 0.4) {
+					offset_points_[i].is_feature() = true;
+
+					// get initial neighbors
+					offset_points_neighbors[i] = std::vector<int>(nMatches);
+					for (int j = 0; j < nMatches; ++j) {
+						offset_points_neighbors[i][j] = ret_matches[j].first;
+					}
+				}
+			}
+		}
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+		TC.count_time("identify potential feature points");
+#endif
+		// initial potential normals
+		std::vector<Eigen::Vector3d> potential_normals(offset_points_size_);
+#pragma omp parallel for
+		for (int i = 0; i < offset_points_size_; ++i) {
+			if (offset_points_[i].is_feature()) {
+				alglib::clusterizerstate s;
+				alglib::kmeansreport rep;
+				alglib::real_2d_array xy; // two normals of the neighborhood of point i
+				int k = offset_points_neighbors[i].size();
+				xy.setlength(k, 3);
+				for (int j = 0; j < k; ++j) {
+					xy[j][0] = offset_points_[offset_points_neighbors[i][j]].nor().x();
+					xy[j][1] = offset_points_[offset_points_neighbors[i][j]].nor().y();
+					xy[j][2] = offset_points_[offset_points_neighbors[i][j]].nor().z();
+				}
+				alglib::clusterizercreate(s);
+				alglib::clusterizersetpoints(s, xy, 2);
+				alglib::clusterizersetkmeanslimits(s, 10, 0);
+				alglib::clusterizerrunkmeans(s, 2, rep);
+
+				Eigen::Vector3d C1, C2;
+				if (int(rep.terminationtype) == -3) {
+					C1 = offset_points_[i].nor();
+					C2 = offset_points_[i].nor();
+				}
+				else {
+					C1[0] = rep.c[0][0];
+					C1[1] = rep.c[0][1];
+					C1[2] = rep.c[0][2];
+					C2[0] = rep.c[1][0];
+					C2[1] = rep.c[1][1];
+					C2[2] = rep.c[1][2];
+				}
+				C1 = C1.normalized();
+				C2 = C2.normalized();
+
+				double C1C2_angle = safetyAcos(C1.dot(C2));
+
+				// filter flat region point
+				if (C1C2_angle < min_angle || C1C2_angle > max_angle) {
+					offset_points_[i].is_feature() = false;
+				}
+
+				// get potential feature point's normal
+				potential_normals[i] = (C1 + C2).normalized();
+				// offset_points_[i].nor() = (C1 + C2).normalized();
+			}
+		}
+
+#ifdef DEBUG_SERIAL_POTENTIAL_FEATURE_POINTS
+		{
+			std::ofstream pfp_out(debug_file_path + DEBUG_SERIAL_POTENTIAL_FEATURE_POINTS + "Potential_Feature_Points.obj");
+			for (int i = 0; i < offset_points_size_; ++i)
+			{
+				if (offset_points_[i].is_delete() == false && offset_points_[i].is_feature())
+				{
+					pfp_out << "v" << " " << offset_points_[i].cor().transpose() << std::endl;
+				}
+			}
+			pfp_out.close();
+		}
+#endif
+
+		// resample potential feature points
+		if (1) {
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.start();
+#endif
+			const double resample_radis = 0.49 * sample_dis;
+			const int resample_num = 5;
+			const double resample_angle = 60;
+
+			std::vector<std::vector<OffsetPoint>> offset_points_openmp(num_procs_);
+			std::vector<std::vector<Eigen::Vector3d>> potential_normals_openmp(num_procs_);
+#pragma omp parallel for
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_feature() == false) continue;
+
+				Eigen::Vector3d f_nor = offset_points_[i].nor();
+				Eigen::Vector3d p_vec(0, 0, 0);
+				if (f_nor.x() > EPS || f_nor.x() < -EPS) {
+					p_vec.y() = 1;
+					p_vec.x() = -f_nor.y() / f_nor.x();
+				}
+				else if (f_nor.y() > EPS || f_nor.y() < -EPS) {
+					p_vec.z() = 1;
+					p_vec.y() = -f_nor.z() / f_nor.y();
+				}
+				else if (f_nor.z() > EPS || f_nor.z() < -EPS) {
+					p_vec.x() = 1;
+				}
+				else {
+					DEBUG_ONLY_COUT("offset point's normal may be zero!");
+					continue;
+				}
+				p_vec.normalize();
+				if (isnan(p_vec.x()) || isnan(p_vec.y()) || isnan(p_vec.z())) continue;
+
+				// std::cout << i << " " << p_vec.transpose() << " " << f_nor.transpose() << std::endl;
+
+				if (0) { // uniformly sample normal disk; now is disuse
+					for (double cur_angle = 0; cur_angle < 360; cur_angle += resample_angle) {
+						Eigen::Vector3d dir = Slerp(p_vec, f_nor, cur_angle);
+						for (int j = 0; j < resample_num; ++j) {
+							Eigen::Vector3d sp_cor = offset_points_[i].cor() + double(j + 1) / resample_num * resample_radis * dir;
+
+							offset_points_.emplace_back(OffsetPoint(sp_cor, f_nor, true, false));
+						}
+					}
+				}
+				else if (1) { // randomly sample normal disk
+					for (int j = 0; j < resample_num; ++j) {
+						double r1 = ((double)rand()) / RAND_MAX;
+						double r2 = ((double)rand()) / RAND_MAX;
+
+						Eigen::Vector3d dir = Slerp(p_vec, f_nor, r1 * 360);
+						Eigen::Vector3d sp_cor = offset_points_[i].cor() + r2 * resample_radis * dir;
+
+						offset_points_openmp[omp_get_thread_num()].emplace_back(OffsetPoint(sp_cor, f_nor, true, false));
+						potential_normals_openmp[omp_get_thread_num()].emplace_back(potential_normals[i]);
+					}
+				}
+			}
+			for (int i = 0; i < num_procs_; ++i) {
+				offset_points_.insert(offset_points_.end(), offset_points_openmp[i].begin(), offset_points_openmp[i].end());
+				potential_normals.insert(potential_normals.end(), potential_normals_openmp[i].begin(), potential_normals_openmp[i].end());
+				(std::vector<OffsetPoint>()).swap(offset_points_openmp[i]);
+			}
+			offset_points_size_ = offset_points_.size();
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("resample potential feature points");
+#endif
+#ifdef DEBUG_SERIAL_RESAMPLE_FEATURE_POINTS
+			{
+				std::ofstream rsp_out(debug_file_path + DEBUG_SERIAL_RESAMPLE_FEATURE_POINTS + "Resample_Points.obj");
+				for (auto p : offset_points_) {
+					if (p.is_feature()) {
+						rsp_out << "v" << " " << p.cor().transpose() << std::endl;
+					}
+				}
+				rsp_out.close();
+			}
+#endif
+		}
+
+		build_kd_tree_cloud();
+		my_kd_tree_t index2(3, cloud_, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+		// find neighbor points
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+		TC.start();
+#endif
+		(std::vector<std::vector<int>>(offset_points_size_)).swap(offset_points_neighbors);
+		{
+			const double search_radius = static_cast<double>(neigh_search_radis * neigh_search_radis);
+#pragma omp parallel for
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_feature() == true) {
+					vector<std::pair<uint32_t, double>> ret_matches;
+					const size_t nMatches = index2.radiusSearch(&offset_points_[i].cor()[0], search_radius, ret_matches, params);
+
+					offset_points_neighbors[i] = std::vector<int>(nMatches);
+					for (int j = 0; j < nMatches; ++j) {
+						offset_points_neighbors[i][j] = ret_matches[j].first;
+					}
+				}
+			}
+		}
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+		TC.count_time("find offset points' neighbors");
+		TC.start();
+#endif
+
+		// k-means get feature normals
+		// std::vector<Eigen::Vector3d> potential_normals(offset_points_size_);
+		if (0) { // if the reconstruction do not need feature points' normals, can set to FALSE
+#pragma omp parallel for
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_feature()) {
+					alglib::clusterizerstate s;
+					alglib::kmeansreport rep;
+					alglib::real_2d_array xy; // two normals of the neighborhood of point i
+					int k = offset_points_neighbors[i].size();
+					xy.setlength(k, 3);
+					for (int j = 0; j < k; ++j) {
+						xy[j][0] = offset_points_[offset_points_neighbors[i][j]].nor().x();
+						xy[j][1] = offset_points_[offset_points_neighbors[i][j]].nor().y();
+						xy[j][2] = offset_points_[offset_points_neighbors[i][j]].nor().z();
+					}
+					alglib::clusterizercreate(s);
+					alglib::clusterizersetpoints(s, xy, 2);
+					alglib::clusterizersetkmeanslimits(s, 10, 0);
+					alglib::clusterizerrunkmeans(s, 2, rep);
+
+					Eigen::Vector3d C1, C2;
+					if (int(rep.terminationtype) == -3) {
+						C1 = offset_points_[i].nor();
+						C2 = offset_points_[i].nor();
+					}
+					else {
+						C1[0] = rep.c[0][0];
+						C1[1] = rep.c[0][1];
+						C1[2] = rep.c[0][2];
+						C2[0] = rep.c[1][0];
+						C2[1] = rep.c[1][1];
+						C2[2] = rep.c[1][2];
+					}
+					C1 = C1.normalized();
+					C2 = C2.normalized();
+
+					double C1C2_angle = safetyAcos(C1.dot(C2));
+
+					// filter flat region point
+					if (C1C2_angle < min_angle || C1C2_angle > max_angle) {
+						offset_points_[i].is_feature() = false;
+					}
+
+					// get potential feature point's normal
+					potential_normals[i] = (C1 + C2).normalized();
+					// offset_points_[i].nor() = (C1 + C2).normalized();
+				}
+			}
+		}
+
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+		TC.count_time("k-means to get feature point normals");
+		TC.start();
+#endif
+
+		// generate feature points
+		if (1) { // tangent plane + closest distance
+			std::unordered_map<int, int> fea_to_ori;
+			int feature_cnt = 0;
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_delete() == false && offset_points_[i].is_feature()) {
+					fea_to_ori[feature_cnt++] = i;
+				}
+			}
+#ifdef DEBUG_SERIAL_FEATURE_POINTS_FUNC
+			std::vector<double> feature_points_funcs(feature_cnt, -1);
+#endif
+
+			const double mu = 0.1;
+			std::vector<Eigen::Vector3d> fea_new_points(feature_cnt);
+#pragma omp parallel for
+			for (int fi = 0; fi < feature_cnt; ++fi) {
+				int i = fea_to_ori[fi];
+
+				std::function<void(const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)> function_grad
+					= [&](const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr) {
+					func = 0.0;
+					grad[0], grad[1], grad[2] = 0.0, 0.0, 0.0;
+
+					Eigen::Vector3d zi(x[0], x[1], x[2]);
+					Eigen::Vector3d zipj;
+					Eigen::Vector3d g(0, 0, 0);
+					double zipj_dot_n;
+
+					// tangent plane cut
+					for (int j = 0, j_end = offset_points_neighbors[i].size(); j < j_end; ++j) {
+						int nei_j = offset_points_neighbors[i][j];
+
+						zipj = zi - offset_points_[nei_j].cor();
+						zipj_dot_n = zipj.dot(offset_points_[nei_j].nor());
+
+						func += zipj_dot_n * zipj_dot_n;
+						g += 2 * zipj_dot_n * offset_points_[nei_j].nor();
+					}
+
+					func += mu * (zi - offset_points_[i].cor()).squaredNorm();
+					g += 2 * mu * (zi - offset_points_[i].cor());
+
+					grad[0] = g.x();
+					grad[1] = g.y();
+					grad[2] = g.z();
+				};
+
+				alglib::real_1d_array s = "[1,1,1]";
+				alglib::real_1d_array x = "[0,0,0]";
+				x.setlength(3);
+				x[0] = offset_points_[i].cor().x();
+				x[1] = offset_points_[i].cor().y();
+				x[2] = offset_points_[i].cor().z();
+
+				alglib::ae_int_t maxits = 0;
+				double epsg = 0;
+				double epsf = 0;
+				double epsx = 0;
+				alglib::minbleicstate state;
+				alglib::minbleiccreate(x, state);
+				alglib::minbleicsetscale(state, s);
+				alglib::minbleicsetcond(state, epsg, epsf, epsx, maxits);
+				alglib::minbleicoptguardsmoothness(state);
+				alglib::minbleicoptguardgradient(state, 0);
+				alglib::minbleicreport rep;
+				alglib::minbleicoptimize(state, function_grad);
+				alglib::minbleicresults(state, x, rep);
+
+				fea_new_points[fi] = Eigen::Vector3d(x[0], x[1], x[2]);
+
+#ifdef DEBUG_SERIAL_FEATURE_POINTS_FUNC
+				double cur_func = 0;
+				Eigen::Vector3d zi(x[0], x[1], x[2]);
+				Eigen::Vector3d zipj;
+				Eigen::Vector3d g(0, 0, 0);
+				double zipj_dot_n;
+				for (int j = 0, j_end = offset_points_neighbors[i].size(); j < j_end; ++j) {
+					int nei_j = offset_points_neighbors[i][j];
+
+					zipj = (zi - offset_points_[nei_j].cor()).normalized();
+					zipj_dot_n = zipj.dot(offset_points_[nei_j].nor());
+
+					cur_func += zipj_dot_n * zipj_dot_n;
+				}
+				feature_points_funcs[fi] = cur_func / offset_points_neighbors[i].size();
+#endif
+			}
+
+			// renew
+#pragma omp parallel for
+			for (int fi = 0; fi < feature_cnt; ++fi) {
+				int i = fea_to_ori[fi];
+
+				if ((offset_points_[i].cor() - fea_new_points[fi]).norm() > 5 * identify_radis) {
+					offset_points_[i].delete_type() = 3;
+					offset_points_[i].is_feature() = false;
+				}
+				else {
+					offset_points_[i].cor() = fea_new_points[fi];
+					offset_points_[i].nor() = potential_normals[i];
+				}
+			}
+
+#ifdef DEBUG_SERIAL_FEATURE_POINTS_FUNC
+			{
+				double max_func = -MAX;
+				double min_func = MAX;
+				for (int fi = 0; fi < feature_cnt; ++fi) {
+					max_func = std::max(max_func, feature_points_funcs[fi]);
+					min_func = std::min(min_func, feature_points_funcs[fi]);
+				}
+				std::ofstream out(debug_file_path + DEBUG_SERIAL_FEATURE_POINTS_FUNC + "Feature_Points_Func.obj");
+				for (int fi = 0; fi < feature_cnt; ++fi) {
+					int i = fea_to_ori[fi];
+
+					if (offset_points_[i].is_feature()) {
+						out << "v" << " " << offset_points_[i].cor().transpose() << " " << ((feature_points_funcs[fi] - min_func) / (max_func - min_func) * Eigen::Vector3d(255, 0, 0)).transpose() << std::endl;
+					}
+				}
+				out.close();
+			}
+#endif
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("generate feature points and renew");
+			TC.start();
+#endif
+			// DEBUG_ONLY_COUT("function_grad calc cnt:" << " " << function_calc_cnt);
+		}
+		else if (0) { // only tangent plane
+			int function_calc_cnt = 0;
+#pragma omp parallel for reduction(+:function_calc_cnt)
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_feature() == false || offset_points_[i].is_boundary()) {
+					continue;
+				}
+
+				std::function<void(const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)> function_grad
+					= [&](const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr) {
+					func = 0.0;
+					grad[0], grad[1], grad[2] = 0.0, 0.0, 0.0;
+
+					Eigen::Vector3d zi(x[0], x[1], x[2]);
+					Eigen::Vector3d zipj;
+					Eigen::Vector3d g(0, 0, 0);
+					double zipj_dot_n;
+
+					// tangent plane cut
+					for (int j = 0, j_end = offset_points_neighbors[i].size(); j < j_end; ++j) {
+						int nei_j = offset_points_neighbors[i][j];
+
+						zipj = zi - offset_points_[nei_j].cor();
+						zipj_dot_n = zipj.dot(offset_points_[nei_j].nor());
+
+						func += zipj_dot_n * zipj_dot_n;
+						g += 2 * zipj_dot_n * offset_points_[nei_j].nor();
+					}
+
+					grad[0] = g.x();
+					grad[1] = g.y();
+					grad[2] = g.z();
+
+					function_calc_cnt++;
+				};
+
+				alglib::real_1d_array x = "[0,0,0]";
+				x.setlength(3);
+				x[0] = offset_points_[i].cor().x();
+				x[1] = offset_points_[i].cor().y();
+				x[2] = offset_points_[i].cor().z();
+
+				alglib::real_1d_array s = "[1,1,1]";
+				alglib::ae_int_t maxits = 0;
+				double epsg = 0;
+				double epsf = 0;
+				double epsx = 0;
+				alglib::minlbfgsstate state;
+				alglib::minlbfgscreate(3, 3, x, state);
+				alglib::minlbfgssetcond(state, epsg, epsf, epsx, maxits);
+				alglib::minlbfgssetscale(state, s);
+				alglib::minlbfgsreport rep;
+				alglib::minlbfgsoptimize(state, function_grad);
+				alglib::minlbfgsresults(state, x, rep);
+
+				Eigen::Vector3d target(x[0], x[1], x[2]);
+
+				if ((offset_points_[i].cor() - target).norm() > 1000 * identify_radis) { // can set to 5
+					offset_points_[i].delete_type() = 3;
+					offset_points_[i].is_feature() = false;
+				}
+				else {
+					offset_points_[i].cor() = target;
+					// offset_points_[i].nor() = potential_normals[i];
+				}
+			}
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("generate feature points and renew");
+			TC.start();
+#endif
+			DEBUG_ONLY_COUT("function_grad calc cnt:" << " " << function_calc_cnt);
+		}
+		else if (0) { // tangent plane + move points away
+			std::unordered_map<int, int> fea_to_ori;
+			int feature_cnt = 0;
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_delete() == false && offset_points_[i].is_feature()) {
+					fea_to_ori[feature_cnt++] = i;
+				}
+			}
+			nanoflann::SearchParams params;
+			PointCloud<double> feature_cloud;
+			feature_cloud.pts.resize(feature_cnt);
+			for (int i = 0; i < feature_cnt; ++i) {
+				feature_cloud.pts[i].x = offset_points_[fea_to_ori[i]].cor().x();
+				feature_cloud.pts[i].y = offset_points_[fea_to_ori[i]].cor().y();
+				feature_cloud.pts[i].z = offset_points_[fea_to_ori[i]].cor().z();
+			}
+
+			// renew neighbors
+			std::vector<std::vector<int>> feature_points_neighbors(feature_cnt);
+			{
+				const double search_radius = static_cast<double>(neigh_search_radis * neigh_search_radis);
+#pragma omp parallel for
+				for (int fi = 0; fi < feature_cnt; ++fi) {
+					vector<std::pair<uint32_t, double>> ret_matches;
+					const size_t nMatches = index.radiusSearch(&feature_cloud.pts[fi].x, search_radius, ret_matches, params);
+
+					feature_points_neighbors[fi] = std::vector<int>(nMatches);
+					for (int j = 0; j < nMatches; ++j) {
+						feature_points_neighbors[fi][j] = ret_matches[j].first;
+					}
+				}
+			}
+
+			int iter_num = 1;
+			for (int n = 0; n < iter_num; ++n) {
+#pragma omp parallel for
+				for (int fi = 0; fi < feature_cnt; ++fi) {
+					std::function<void(const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)> function_grad
+						= [&](const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr) {
+						func = 0.0;
+						grad[0], grad[1], grad[2] = 0.0, 0.0, 0.0;
+
+						Eigen::Vector3d zi(x[0], x[1], x[2]);
+						Eigen::Vector3d zipj;
+						Eigen::Vector3d g(0, 0, 0);
+						double zipj_dot_n;
+
+						// tangent plane cut
+						for (int j = 0, j_end = feature_points_neighbors[fi].size(); j < j_end; ++j) {
+							int nei_j = feature_points_neighbors[fi][j];
+
+							zipj = zi - offset_points_[nei_j].cor();
+							zipj_dot_n = zipj.dot(offset_points_[nei_j].nor());
+
+							func += zipj_dot_n * zipj_dot_n;
+							g += 2 * zipj_dot_n * offset_points_[nei_j].nor();
+						}
+
+						Eigen::Vector3d ori_cor(feature_cloud.pts[fi].x, feature_cloud.pts[fi].y, feature_cloud.pts[fi].z);
+						func += 0.001 * (zi - ori_cor).squaredNorm();
+						g += 2 * 0.001 * (zi - ori_cor);
+
+						grad[0] = g.x();
+						grad[1] = g.y();
+						grad[2] = g.z();
+					};
+
+					alglib::real_1d_array x = "[0,0,0]";
+					x.setlength(3);
+					x[0] = feature_cloud.pts[fi].x;
+					x[1] = feature_cloud.pts[fi].y;
+					x[2] = feature_cloud.pts[fi].z;
+
+					alglib::real_1d_array s = "[1,1,1]";
+					alglib::ae_int_t maxits = 0;
+					double epsg = 0;
+					double epsf = 0;
+					double epsx = 0;
+					if (0) {
+						alglib::minlbfgsstate state;
+						alglib::minlbfgscreate(3, 3, x, state);
+						alglib::minlbfgssetcond(state, epsg, epsf, epsx, maxits);
+						alglib::minlbfgssetscale(state, s);
+						alglib::minlbfgsreport rep;
+						alglib::minlbfgsoptimize(state, function_grad);
+						alglib::minlbfgsresults(state, x, rep);
+					}
+					else {
+						alglib::minbleicstate state;
+						alglib::minbleiccreate(x, state);
+						alglib::minbleicsetscale(state, s);
+						alglib::minbleicsetcond(state, epsg, epsf, epsx, maxits);
+						alglib::minbleicoptguardsmoothness(state);
+						alglib::minbleicoptguardgradient(state, 0);
+						alglib::minbleicreport rep;
+						alglib::minbleicoptimize(state, function_grad);
+						alglib::minbleicresults(state, x, rep);
+					}
+					Eigen::Vector3d target(x[0], x[1], x[2]);
+					Eigen::Vector3d oricor(feature_cloud.pts[fi].x, feature_cloud.pts[fi].y, feature_cloud.pts[fi].z);
+
+					if ((target - oricor).norm() < 5 * sample_dis) {
+						feature_cloud.pts[fi].x = target.x();
+						feature_cloud.pts[fi].y = target.y();
+						feature_cloud.pts[fi].z = target.z();
+					}
+				}
+
+				if (n == iter_num - 1) break;
+
+				// renew kd tree
+				my_kd_tree_t feature_index(3, feature_cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+				feature_index.buildIndex();
+
+				// move near points away
+				std::vector<Eigen::Vector3d> new_feature_dirs(feature_cnt);
+				for (int fi = 0; fi < feature_cnt; ++fi) {
+					int i = fea_to_ori[fi];
+
+					vector<std::pair<uint32_t, double>> ret_matches;
+					const double search_radius = static_cast<double>(identify_radis * identify_radis);
+					const size_t nMatches = feature_index.radiusSearch(&feature_cloud.pts[fi].x, search_radius, ret_matches, params);
+
+					Eigen::Vector3d move_dir(0, 0, 0);
+					for (int j = 1; j < nMatches; ++j) {
+						int nei_i = ret_matches[j].first;
+						Eigen::Vector3d xixk(
+							feature_cloud.pts[fi].x - feature_cloud.pts[nei_i].x,
+							feature_cloud.pts[fi].y - feature_cloud.pts[nei_i].y,
+							feature_cloud.pts[fi].z - feature_cloud.pts[nei_i].z);
+						double move_dis;
+						if (xixk.norm() > 1 * sample_dis) {
+							move_dis = 0;
+						}
+						else {
+							move_dis = 1 * sample_dis - xixk.norm();
+						}
+						move_dir -= move_dis * xixk.normalized();
+					}
+					move_dir /= nMatches;
+
+					// move_dir.normalize();
+					if (isnan(move_dir.x()) || isnan(move_dir.y()) || isnan(move_dir.z())) continue;
+
+					new_feature_dirs[fi] = move_dir;
+					// std::cout << move_dir.norm() << std::endl;
+				}
+				
+				for (int fi = 0; fi < feature_cnt; ++fi) {
+					feature_cloud.pts[fi].x += new_feature_dirs[fi].x();
+					feature_cloud.pts[fi].y += new_feature_dirs[fi].y();
+					feature_cloud.pts[fi].z += new_feature_dirs[fi].z();
+				}
+
+				// relocate
+#pragma omp parallel for
+				for (int fi = 0; fi < feature_cnt; ++fi) {
+					const AABB_Point query(feature_cloud.pts[fi].x, feature_cloud.pts[fi].y, feature_cloud.pts[fi].z);
+					Point_and_primitive_id pp = mesh_->aabb_tree().closest_point_and_primitive(query);
+					const AABB_Point cp = pp.first;
+					double sqd = (cp - query).squared_length();
+					double qd = sqrt(sqd);
+
+					if (abs(qd - abs(offset_dis)) > 1e-12) {
+						Eigen::Vector3d relocate_dir(query.x() - cp.x(), query.y() - cp.y(), query.z() - cp.z());
+						relocate_dir.normalize();
+
+						feature_cloud.pts[fi].x = cp.x() + abs(offset_dis) * relocate_dir.x();
+						feature_cloud.pts[fi].y = cp.y() + abs(offset_dis) * relocate_dir.y();
+						feature_cloud.pts[fi].z = cp.z() + abs(offset_dis) * relocate_dir.z();
+					}
+				}
+
+			}
+
+			// renew
+			for (int fi = 0; fi < feature_cnt; ++fi) {
+				offset_points_[fea_to_ori[fi]].cor().x() = feature_cloud.pts[fi].x;
+				offset_points_[fea_to_ori[fi]].cor().y() = feature_cloud.pts[fi].y;
+				offset_points_[fea_to_ori[fi]].cor().z() = feature_cloud.pts[fi].z;
+			}
+		}
+		else if (0){ // tangent plane and feature points' distances
+			std::unordered_map<int, int> fea_to_ori;
+			int feature_cnt = 0;
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_delete() == false && offset_points_[i].is_feature()) {
+					fea_to_ori[feature_cnt++] = i;
+				}
+			}
+			nanoflann::SearchParams params;
+			alglib::real_1d_array x;
+			alglib::real_1d_array s;
+			x.setlength(3 * feature_cnt);
+			s.setlength(3 * feature_cnt);
+			PointCloud<double> feature_cloud;
+			feature_cloud.pts.resize(feature_cnt);
+#pragma omp parallel for
+			for (int i = 0; i < feature_cnt; ++i) {
+				x[3 * i] = offset_points_[fea_to_ori[i]].cor().x();
+				x[3 * i + 1] = offset_points_[fea_to_ori[i]].cor().y();
+				x[3 * i + 2] = offset_points_[fea_to_ori[i]].cor().z();
+				s[3 * i] = 1;
+				s[3 * i + 1] = 1;
+				s[3 * i + 2] = 1;
+				feature_cloud.pts[i].x = x[3 * i];
+				feature_cloud.pts[i].y = x[3 * i + 1];
+				feature_cloud.pts[i].z = x[3 * i + 2];
+			}
+			my_kd_tree_t feature_index(3, feature_cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+			feature_index.buildIndex();
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("build feature point kd-tree");
+			TC.start();
+#endif
+
+			int function_calc_cnt = 0;
+			std::function<void(const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)> function_grad
+				= [&](const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)
+				{
+					// init
+					func = 0.0;
+					for (int i = 0; i < feature_cnt; ++i) {
+						grad[3 * i] = 0.0;
+						grad[3 * i + 1] = 0.0;
+						grad[3 * i + 2] = 0.0;
+					}
+
+					// renew feature points' kd tree
+					// if (function_calc_cnt % 20 == 0)
+					{
+						for (int i = 0; i < feature_cnt; ++i) {
+							feature_cloud.pts[i].x = x[3 * i];
+							feature_cloud.pts[i].y = x[3 * i + 1];
+							feature_cloud.pts[i].z = x[3 * i + 2];
+						}
+						// my_kd_tree_t feature_index(3, feature_cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+						feature_index.buildIndex();
+					}
+
+					// calc func and grad
+					for (int i = 0; i < feature_cnt; ++i) {
+						Eigen::Vector3d xi(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+
+						// tangent plane cut (fixed neighborhood)
+						double tangent_func_tmp = 0;
+						Eigen::Vector3d tangent_grad_tmp(0, 0, 0);
+						for (int j = 0, j_end = offset_points_neighbors[fea_to_ori[i]].size(); j < j_end; ++j) {
+							Eigen::Vector3d xipj = xi - offset_points_[offset_points_neighbors[fea_to_ori[i]][j]].cor();
+							double xipj_nj = xipj.dot(offset_points_[offset_points_neighbors[fea_to_ori[i]][j]].nor());
+
+							tangent_func_tmp += xipj_nj * xipj_nj;
+							tangent_grad_tmp += 2 * xipj_nj * offset_points_[offset_points_neighbors[fea_to_ori[i]][j]].nor();
+						}
+
+						func += tangent_func_tmp;
+						grad[3 * i] += tangent_grad_tmp.x();
+						grad[3 * i + 1] += tangent_grad_tmp.y();
+						grad[3 * i + 2] += tangent_grad_tmp.z();
+
+						// get feature neighborhood
+						vector<std::pair<uint32_t, double>> ret_matches;
+						const double search_radius = static_cast<double>(identify_radis * identify_radis);
+						const size_t nMatches = feature_index.radiusSearch(&xi[0], search_radius, ret_matches, params);
+
+						// distance
+						double distance_func_tmp = 0;
+						Eigen::Vector3d distance_grad_tmp(0, 0, 0);
+						for (int j = 0; j < nMatches; ++j) {
+							if (ret_matches[j].first == i) {
+								continue;
+							}
+
+							Eigen::Vector3d xk(x[3 * ret_matches[j].first], x[3 * ret_matches[j].first + 1], x[3 * ret_matches[j].first + 2]);
+							Eigen::Vector3d xixk = xi - xk;
+
+							double sq_dis = xixk.squaredNorm();
+
+							distance_func_tmp += 1 / sq_dis;
+							distance_grad_tmp -= 2 / (sq_dis * sq_dis) * xixk;
+						}
+
+						// update func and grad
+						double lambda;
+						if (distance_grad_tmp.squaredNorm() < EPS) {
+							lambda = 0;
+						}
+						else {
+							// lambda = 0.8 * tangent_grad_tmp.squaredNorm() / distance_grad_tmp.squaredNorm();
+							lambda = 0.6 * tangent_grad_tmp.norm() / distance_grad_tmp.norm();
+							// lambda = max(exp(-2 * pow(func_calc_num, 2) / 40000), 0.8) * tangent_grad_tmp.norm() / distance_grad_tmp.norm();
+						}
+
+						func += lambda * distance_func_tmp;
+						grad[3 * i]		+= lambda * distance_grad_tmp.x();
+						grad[3 * i + 1] += lambda * distance_grad_tmp.y();
+						grad[3 * i + 2] += lambda * distance_grad_tmp.z();
+
+						function_calc_cnt++;
+					}
+
+					// normalize
+					func /= feature_cnt;
+					for (int i = 0; i < feature_cnt; ++i) {
+						grad[3 * i] /= feature_cnt;
+						grad[3 * i + 1] /= feature_cnt;
+						grad[3 * i + 2] /= feature_cnt;
+					}
+
+					// test for output
+					/*if (function_calc_cnt % 100 == 0) {
+						double grad_sq_norm = 0;
+						for (int k = 0; k < 3 * feature_cnt; ++k) {
+							grad_sq_norm += grad[k] * grad[k];
+						}
+						DEBUG_ONLY_COUT("function_grad calc cnt:" << " " << function_calc_cnt << " func:" << func << " grad_sq_norm:" << grad_sq_norm);
+					}*/
+				};
+
+			// BLEIC or lbfgs
+			if (1) {
+				alglib::ae_int_t maxits = 0;
+				double epsg = 1e-4;
+				double epsf = 0; // 1e-6
+				double epsx = 0;
+				alglib::minbleicstate state;
+				alglib::minbleiccreate(x, state);
+				alglib::minbleicsetscale(state, s);
+				alglib::minbleicsetcond(state, epsg, epsf, epsx, maxits);
+				alglib::minbleicoptguardsmoothness(state);
+				alglib::minbleicoptguardgradient(state, 0);
+				alglib::minbleicreport rep;
+				alglib::minbleicoptimize(state, function_grad);
+				alglib::minbleicresults(state, x, rep);
+			}
+			else if (0) {
+				alglib::ae_int_t maxits = 0;
+				double epsg = 1e-6;
+				double epsf = 1e-6;
+				double epsx = 0;
+				alglib::minlbfgsstate state;
+				alglib::minlbfgscreate(1, x, state);
+				alglib::minlbfgssetcond(state, epsg, epsf, epsx, maxits);
+				alglib::minlbfgssetscale(state, s);
+				alglib::minlbfgsreport rep;
+				alglib::minlbfgsoptimize(state, function_grad);
+				DEBUG_ONLY_COUT("function_grad calc cnt:" << " " << function_calc_cnt);
+				alglib::minlbfgsresults(state, x, rep);
+			}
+
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("generate feature points");
+			TC.start();
+#endif
+#pragma omp parallel for
+			for (int i = 0; i < feature_cnt; ++i) {
+				Eigen::Vector3d* offset_point_cor = &(offset_points_[fea_to_ori[i]].cor());
+				Eigen::Vector3d target_cor(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+
+				if ((*offset_point_cor - target_cor).norm() > 5 * identify_radis) {
+					offset_points_[fea_to_ori[i]].delete_type() = 3;
+					offset_points_[fea_to_ori[i]].is_feature() = false;
+				}
+				else {
+					*offset_point_cor = target_cor;
+					// offset_points_[fea_to_ori[i]].nor() = potential_normals[fea_to_ori[i]];
+				}
+				// offset_points_[fea_to_ori[i]].cor() = Eigen::Vector3d(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+			}
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("renew feature points");
+			TC.start();
+#endif
+		}
+		else if (0) { // only tangent plane, but in n dimenson
+			std::unordered_map<int, int> fea_to_ori;
+			int feature_cnt = 0;
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_delete() == false && offset_points_[i].is_feature()) {
+					fea_to_ori[feature_cnt++] = i;
+				}
+			}
+
+			nanoflann::SearchParams params;
+			alglib::real_1d_array x;
+			alglib::real_1d_array s;
+			x.setlength(3 * feature_cnt);
+			s.setlength(3 * feature_cnt);
+#pragma omp parallel for
+			for (int i = 0; i < feature_cnt; ++i) {
+				x[3 * i]		= offset_points_[fea_to_ori[i]].cor().x();
+				x[3 * i + 1]	= offset_points_[fea_to_ori[i]].cor().y();
+				x[3 * i + 2]	= offset_points_[fea_to_ori[i]].cor().z();
+				s[3 * i]		= 1;
+				s[3 * i + 1]	= 1;
+				s[3 * i + 2]	= 1;
+			}
+			// my_kd_tree_t feature_index(3, feature_cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+			// feature_index.buildIndex();
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("build feature point kd-tree");
+			TC.start();
+#endif
+
+			std::function<void(const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)> function_grad
+				= [&](const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)
+				{
+					// init
+					func = 0.0;
+					for (int i = 0; i < feature_cnt; ++i) {
+						grad[3 * i] = 0.0;
+						grad[3 * i + 1] = 0.0;
+						grad[3 * i + 2] = 0.0;
+					}
+
+					// calc func and grad
+					for (int i = 0; i < feature_cnt; ++i) {
+						Eigen::Vector3d xi(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+
+						// tangent plane cut (fixed neighborhood)
+						double tangent_func_tmp = 0;
+						Eigen::Vector3d tangent_grad_tmp(0, 0, 0);
+						for (int j = 0, j_end = offset_points_neighbors[fea_to_ori[i]].size(); j < j_end; ++j) {
+							int nei_j = offset_points_neighbors[fea_to_ori[i]][j];
+
+							Eigen::Vector3d xipj = xi - offset_points_[nei_j].cor();
+							double xipj_nj = xipj.dot(offset_points_[nei_j].nor());
+
+							tangent_func_tmp += xipj_nj * xipj_nj;
+							tangent_grad_tmp += 2 * xipj_nj * offset_points_[nei_j].nor();
+						}
+
+						func += tangent_func_tmp;
+						grad[3 * i]		+= tangent_grad_tmp.x();
+						grad[3 * i + 1] += tangent_grad_tmp.y();
+						grad[3 * i + 2] += tangent_grad_tmp.z();
+					}
+
+					// normalize
+					func /= feature_cnt;
+					for (int i = 0; i < feature_cnt; ++i) {
+						grad[3 * i] /= feature_cnt;
+						grad[3 * i + 1] /= feature_cnt;
+						grad[3 * i + 2] /= feature_cnt;
+					}
+				};
+
+			// BLEIC
+			alglib::ae_int_t maxits = 100;
+			double epsg = 0;
+			double epsf = 0;
+			double epsx = 0;
+			alglib::minbleicstate state;
+			alglib::minbleiccreate(x, state);
+			alglib::minbleicsetscale(state, s);
+			alglib::minbleicsetcond(state, epsg, epsf, epsx, maxits);
+			alglib::minbleicoptguardsmoothness(state);
+			alglib::minbleicoptguardgradient(state, 0);
+			alglib::minbleicreport rep;
+			alglib::minbleicoptimize(state, function_grad);
+			alglib::minbleicresults(state, x, rep);
+
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("generate feature points");
+			TC.start();
+#endif
+#pragma omp parallel for
+			for (int i = 0; i < feature_cnt; ++i) {
+				Eigen::Vector3d* offset_point_cor = &(offset_points_[fea_to_ori[i]].cor());
+				Eigen::Vector3d target_cor(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+
+				if ((*offset_point_cor - target_cor).norm() > 5 * identify_radis) {
+					offset_points_[fea_to_ori[i]].delete_type() = 3;
+					offset_points_[fea_to_ori[i]].is_feature() = false;
+				}
+				else {
+					*offset_point_cor = target_cor;
+					// offset_points_[fea_to_ori[i]].nor() = potential_normals[fea_to_ori[i]];
+				}
+				// offset_points_[fea_to_ori[i]].cor() = Eigen::Vector3d(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+			}
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("renew feature points");
+			TC.start();
+#endif
+		}
+		else if (1) { // tangent plane + features, in n dimenson
+			std::unordered_map<int, int> fea_to_ori;
+			int feature_cnt = 0;
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_delete() == false && offset_points_[i].is_feature()) {
+					fea_to_ori[feature_cnt++] = i;
+				}
+			}
+			if (feature_cnt == 0) {
+				// throw std::runtime_error("feature point cnt is zero!");
+				return 0;
+			}
+
+			nanoflann::SearchParams params;
+			PointCloud<double> feature_cloud;
+			alglib::real_1d_array x;
+			alglib::real_1d_array s;
+			x.setlength(3 * feature_cnt);
+			s.setlength(3 * feature_cnt);
+			feature_cloud.pts.resize(feature_cnt);
+#pragma omp parallel for
+			for (int i = 0; i < feature_cnt; ++i) {
+				x[3 * i] = offset_points_[fea_to_ori[i]].cor().x();
+				x[3 * i + 1] = offset_points_[fea_to_ori[i]].cor().y();
+				x[3 * i + 2] = offset_points_[fea_to_ori[i]].cor().z();
+				s[3 * i] = 1;
+				s[3 * i + 1] = 1;
+				s[3 * i + 2] = 1;
+				feature_cloud.pts[i].x = x[3 * i];
+				feature_cloud.pts[i].y = x[3 * i + 1];
+				feature_cloud.pts[i].z = x[3 * i + 2];
+			}
+			my_kd_tree_t feature_index(3, feature_cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+			// get feature points' neighbors
+			std::vector<std::vector<int>> feature_points_neighbors(feature_cnt);
+			{ 
+				const double search_radius = static_cast<double>(neigh_search_radis * neigh_search_radis);
+#pragma omp parallel for
+				for (int i = 0; i < feature_cnt; ++i) {
+					double query[3] = { feature_cloud.pts[i].x , feature_cloud.pts[i].y , feature_cloud.pts[i].z };
+
+					vector<std::pair<uint32_t, double>> ret_matches;
+					const size_t nMatches = feature_index.radiusSearch(&query[0], search_radius, ret_matches, params);
+
+					if (nMatches > 1) {
+						feature_points_neighbors[i].reserve(nMatches - 1);
+						for (int j = 1; j < nMatches; ++j) {
+							feature_points_neighbors[i].push_back(ret_matches[j].first);
+						}
+					}
+				}
+			}
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("build feature point kd-tree");
+			TC.start();
+#endif
+
+			int function_count_cnt = 0;
+			std::function<void(const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)> function_grad
+				= [&](const alglib::real_1d_array& x, double& func, alglib::real_1d_array& grad, void* ptr)
+				{
+					// init
+					function_count_cnt++;
+					func = 0.0;
+					for (int i = 0; i < feature_cnt; ++i) {
+						grad[3 * i] = 0.0;
+						grad[3 * i + 1] = 0.0;
+						grad[3 * i + 2] = 0.0;
+					}
+
+					// calc func and grad
+					for (int i = 0; i < feature_cnt; ++i) {
+						Eigen::Vector3d xi(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+
+						double tangent_func_tmp = 0;
+						double distance_func_tmp = 0;
+						Eigen::Vector3d tangent_grad_tmp(0, 0, 0);
+						Eigen::Vector3d distance_grad_tmp(0, 0, 0);
+
+						// tangent plane cut
+						for (int j = 0, j_end = offset_points_neighbors[fea_to_ori[i]].size(); j < j_end; ++j) {
+							int nei_j = offset_points_neighbors[fea_to_ori[i]][j];
+
+							Eigen::Vector3d xipj = xi - offset_points_[nei_j].cor();
+							double xipj_nj = xipj.dot(offset_points_[nei_j].nor());
+							tangent_func_tmp += xipj_nj * xipj_nj;
+							tangent_grad_tmp += 2 * xipj_nj * offset_points_[nei_j].nor();
+						}
+						// tangent_func_tmp += 0.001 * (xi - offset_points_[i].cor()).squaredNorm();
+						// tangent_grad_tmp += 2 * 0.001 * (xi - offset_points_[i].cor());
+						// distance
+						for (int j = 0, j_end = feature_points_neighbors[i].size(); j < j_end; ++j) {
+							int nei_j = feature_points_neighbors[i][j];
+
+							Eigen::Vector3d xixj = xi - Eigen::Vector3d(x[3 * nei_j], x[3 * nei_j + 1], x[3 * nei_j + 2]);
+							double sq_dis = xixj.squaredNorm();
+							if (sq_dis < EPS) sq_dis = EPS;
+							distance_func_tmp += 1 / sq_dis;
+							distance_grad_tmp -= 2 / (sq_dis * sq_dis) * xixj;
+						}
+
+						// update func and grad
+						double lambda;
+						if (distance_grad_tmp.squaredNorm() < EPS) {
+							lambda = 0;
+						}
+						else {
+							// lambda = 0.8 * tangent_grad_tmp.squaredNorm() / distance_grad_tmp.squaredNorm();
+							lambda = 0.3 * tangent_grad_tmp.norm() / distance_grad_tmp.norm(); // 0.3
+							// lambda = max(exp(-2 * pow(func_calc_num, 2) / 40000), 0.8) * tangent_grad_tmp.norm() / distance_grad_tmp.norm();
+						}
+
+						func			+= tangent_func_tmp + lambda * distance_func_tmp;
+						grad[3 * i]		+= tangent_grad_tmp.x() + lambda * distance_grad_tmp.x();
+						grad[3 * i + 1] += tangent_grad_tmp.y() + lambda * distance_grad_tmp.y();
+						grad[3 * i + 2] += tangent_grad_tmp.z() + lambda * distance_grad_tmp.z();
+					}
+
+					// normalize
+					/*
+					func /= feature_cnt;
+					for (int i = 0; i < feature_cnt; ++i) {
+						grad[3 * i] /= feature_cnt;
+						grad[3 * i + 1] /= feature_cnt;
+						grad[3 * i + 2] /= feature_cnt;
+					}*/
+				};
+
+			// BLEIC
+			alglib::ae_int_t maxits = 100; // 50
+			double epsg = 0;
+			double epsf = 0;
+			double epsx = 0;
+			alglib::minbleicstate state;
+			alglib::minbleiccreate(x, state);
+			alglib::minbleicsetscale(state, s);
+			alglib::minbleicsetcond(state, epsg, epsf, epsx, maxits);
+			alglib::minbleicoptguardsmoothness(state);
+			alglib::minbleicoptguardgradient(state, 0);
+			alglib::minbleicreport rep;
+			alglib::minbleicoptimize(state, function_grad);
+			alglib::minbleicresults(state, x, rep);
+			DEBUG_ONLY_COUT("function count cnt:" << function_count_cnt);
+
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("generate feature points");
+			TC.start();
+#endif
+#pragma omp parallel for
+			for (int i = 0; i < feature_cnt; ++i) {
+				Eigen::Vector3d* offset_point_cor = &(offset_points_[fea_to_ori[i]].cor());
+				Eigen::Vector3d target_cor(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+
+				if ((*offset_point_cor - target_cor).norm() > 5 * identify_radis) {
+					offset_points_[fea_to_ori[i]].delete_type() = 3;
+					offset_points_[fea_to_ori[i]].is_feature() = false;
+				}
+				else {
+					*offset_point_cor = target_cor;
+					// offset_points_[fea_to_ori[i]].nor() = potential_normals[fea_to_ori[i]];
+				}
+				// offset_points_[fea_to_ori[i]].cor() = Eigen::Vector3d(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+			}
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+			TC.count_time("renew feature points");
+			TC.start();
+#endif
+			}
+
+		// rebuild kd tree
+		build_kd_tree_cloud();
+#ifdef TIME_COUNT_GENERATE_FEATURE_POINTS
+		TC.count_time("rebuild kd tree");
+		TC.print_time_count();
+#endif
+
+		return 1;
+	} // generate_feature_points
+
+	int OffsetPoints::relocate_feature_points(
+		const double offset_dis,
+		const double eps
+	) {
+		DEBUG_ONLY_COUT("");
+		if (mesh_->is_aabb_tree_valid() == false) {
+			mesh_->build_aabb_tree();
+		}
+
+#pragma omp parallel for
+		for (int i = 0; i < offset_points_size_; i++) {
+			if (offset_points_[i].is_delete() == true) continue;
+			if (offset_points_[i].is_feature() == false) continue;
+
+			for (int j = 0; j < 5; ++j) {
+				const AABB_Point query(offset_points_[i].cor().x(), offset_points_[i].cor().y(), offset_points_[i].cor().z());
+				Point_and_primitive_id pp = mesh_->aabb_tree().closest_point_and_primitive(query);
+				const AABB_Point cp = mesh_->aabb_tree().closest_point(query);
+				double sqd = mesh_->aabb_tree().squared_distance(query);
+				double qd = sqrt(sqd);
+
+				double diff_dis = qd - abs(offset_dis);
+				if (abs(diff_dis) > eps) {
+					Eigen::Vector3d relocate_dir(cp.x() - query.x(), cp.y() - query.y(), cp.z() - query.z());
+					relocate_dir.normalize();
+
+					offset_points_[i].cor().x() += diff_dis * relocate_dir.x();
+					offset_points_[i].cor().y() += diff_dis * relocate_dir.y();
+					offset_points_[i].cor().z() += diff_dis * relocate_dir.z();
+				}
+			}
+		}
+
+		return 1;
+	}
+
+	int OffsetPoints::reconstruct_mesh_co3ne(
+		const double radius,
+		std::vector<Eigen::Vector3i>& res_connection
+	) {
+		DEBUG_ONLY_COUT("");
+#ifdef TIME_COUNT_RECONSTRUCT
+		TimeCount TC;
+		TC.start();
+#endif
+
+		if (count_remained_points() < 3) {
+			DEBUG_ONLY_COUT("the number of remained points is less than 3!");
+			return 0;
+		}
+
+		// reconstruct
+		GeoBoxApplication co3neReconstruction;
+		co3neReconstruction.add_offset_points(offset_points_);
+		if (res_connection.size() > 0) {
+			co3neReconstruction.add_init_connection(res_connection);
+		}
+		co3neReconstruction.My_reconstruct_Co3Ne(
+			radius, 
+			res_connection);
+		offset_points_size_ = offset_points_.size();
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("reconstruct");
+		TC.print_time_count();
+#endif
+		return 1;
+	}
+
+	int OffsetPoints::reconstruct_mesh_based_on_base_mesh(
+		const double sample_dis,
+		const std::vector<Eigen::Vector3d>& base_mesh_points,
+		const std::vector<Eigen::Vector3i>& base_mesh_faces,
+		std::vector<Eigen::Vector3i>& res_connection
+	) {
+		DEBUG_ONLY_COUT("");
+#ifdef TIME_COUNT_RECONSTRUCT
+		TimeCount TC;
+		TC.start();
+#endif
+
+		// init
+		if (num_procs_ == 0) {
+			init_openmp();
+		}
+		offset_points_size_ = offset_points_.size();
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("init");
+		TC.start();
+#endif
+
+		// process base mesh
+		if (base_mesh_points.size() == 0 || base_mesh_faces.size() == 0) {
+			DEBUG_ONLY_COUT("base mesh is null!");
+			return 0;
+		}
+		// build base mesh's triangle soup
+		std::vector<AABB_Point> base_mesh_aabb_points;
+		for (int i = 0, i_end = base_mesh_points.size(); i < i_end; ++i) {
+			const Eigen::Vector3d* P = &base_mesh_points[i];
+			base_mesh_aabb_points.push_back(AABB_Point(P->x(), P->y(), P->z()));
+		}
+		std::list<Triangle> base_triangle_soup;
+		for (int i = 0, i_end = base_mesh_faces.size(); i < i_end; ++i) {
+			const Eigen::Vector3i* f = &base_mesh_faces[i];
+			AABB_Point* P1 = &base_mesh_aabb_points[f->x()];
+			AABB_Point* P2 = &base_mesh_aabb_points[f->y()];
+			AABB_Point* P3 = &base_mesh_aabb_points[f->z()];
+			base_triangle_soup.push_back(Triangle(*P1, *P2, *P3));
+		}
+		// construct AABB tree
+		AABB_Triangle_Tree base_mesh_aabb_tree(base_triangle_soup.begin(), base_triangle_soup.end());
+		base_mesh_aabb_tree.accelerate_distance_queries();
+		// another way for test
+		// get base model vertices' neighbor faces
+		std::vector<std::vector<int>> base_point_neighbor_faces(base_mesh_points.size());
+		for (int i = 0, i_end = base_mesh_faces.size(); i < i_end; i++) {
+			base_point_neighbor_faces[base_mesh_faces[i].x()].push_back(i);
+			base_point_neighbor_faces[base_mesh_faces[i].y()].push_back(i);
+			base_point_neighbor_faces[base_mesh_faces[i].z()].push_back(i);
+		}
+		// build base model vertices' kd tree
+		PointCloud<double> base_points_cloud;
+		nanoflann::SearchParams params;
+		const double search_radius = static_cast<double>(25 * sample_dis * sample_dis);
+		base_points_cloud.pts.resize(base_mesh_points.size());
+		for (int i = 0, i_end = base_mesh_points.size(); i < i_end; i++) {
+			base_points_cloud.pts[i].x = base_mesh_points[i].x();
+			base_points_cloud.pts[i].y = base_mesh_points[i].y();
+			base_points_cloud.pts[i].z = base_mesh_points[i].z();
+		}
+		my_kd_tree_t base_points_index(3, base_points_cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+		base_points_index.buildIndex();
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("process base mesh");
+		TC.start();
+#endif
+
+		// build power diagram
+		std::vector<std::vector<int>> RT_neighbors;
+		double feature_weight = 1 * sample_dis;
+		double non_feature_weight = 0.3 * sample_dis;
+		std::vector<double> offset_points_weights(offset_points_.size());
+		for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+			if (offset_points_[i].is_feature()) {
+				offset_points_weights[i] = feature_weight;
+			}
+			else {
+				offset_points_weights[i] = non_feature_weight;
+			}
+		}
+		if (build_regularity_triangulation(
+			sample_dis,
+			offset_points_weights,
+			RT_neighbors
+		) == 0) {
+			DEBUG_ONLY_COUT("build regularity triangulation!");
+			return 0;
+		}
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("build power diagram");
+		TC.start();
+#endif
+
+		// process each point
+		std::map<int, std::set<RPD::RPDPoint>> RPD_cell_connect_points; // point(i) conneted RPD cell's points
+		std::map<std::pair<RPD::RPDPoint, RPD::RPDPoint>, int> RPD_cell_edges; // for test, RPD cell's edges belong to point(i)
+		std::map<int, std::vector<Eigen::Vector3i>> RPD_cell_triangles; // point(i)'s cell's triangles: point(i)->RPD cell points
+
+
+		std::vector<RPD::RPDCell*> PCs(offset_points_.size()); // each point's RPD cell
+		std::map<std::pair<int, int>, bool> RPD_edges_check; // check original RPD's edge being processed
+		// process each RPD cell (do not turn to parallel)
+		for (int i = 0; i < offset_points_size_; ++i) {
+			if (offset_points_[i].is_delete() == false) {
+				RPD::RPDCell* PC = new RPD::RPDCell(offset_points_[i].cor());
+
+				// process connected RPD cell
+				for (int j = 0, j_end = RT_neighbors[i].size(); j < j_end; ++j) {
+					int neighbor_idx = RT_neighbors[i][j];
+
+					Eigen::Vector3d mid_point;
+					if (1) { // power diagram
+						double w1 = (offset_points_[i].is_feature()) ? feature_weight : non_feature_weight;
+						double w2 = (offset_points_[neighbor_idx].is_feature()) ? feature_weight : non_feature_weight;
+						double lambda = 0.5 + 0.5 * (w1 * w1 - w2 * w2) / (offset_points_[i].cor() - offset_points_[neighbor_idx].cor()).squaredNorm();
+						mid_point = lambda * offset_points_[i].cor() + (1 - lambda) * offset_points_[neighbor_idx].cor();
+					}
+					else { // voronoi diagram
+						mid_point = 0.5 * (offset_points_[i].cor() + offset_points_[neighbor_idx].cor());
+					}
+
+					Eigen::Vector3d dir = offset_points_[neighbor_idx].cor() - offset_points_[i].cor();
+
+					PC->cutted_planes_.emplace_back(RPD::RPDPlane(
+						mid_point,
+						dir,
+						neighbor_idx));
+
+					// init RPD_edges_check
+					std::pair<int, int> cur_edge_pair = std::make_pair(std::min(i, neighbor_idx), std::max(i, neighbor_idx));
+					if (RPD_edges_check.find(cur_edge_pair) == RPD_edges_check.end()) {
+						RPD_edges_check[std::make_pair(i, neighbor_idx)] = true;
+					}
+					else {
+						RPD_edges_check[std::make_pair(i, neighbor_idx)] = false;
+					}
+				} // point(i)'s neighbors -> point(j)
+
+				PCs[i] = PC;
+			}
+		}
+		std::vector<Eigen::Vector3i> raw_triangles;
+		for (int i = 0; i < offset_points_size_; ++i) {
+			// if (i > 0) break; // for test
+
+			if (offset_points_[i].is_delete() == true) {
+				continue;
+			}
+
+			if (i % 5000 == 0) {
+				DEBUG_ONLY_COUT("processed point:" << " " << i);
+			}
+
+			RPD::RPDCell* PC = PCs[i];
+			
+			// check each contributory neighbor point
+			std::vector<bool> plane_check; // check each cut plane being processed
+			for (int j = 0, j_end = PC->cutted_planes_.size(); j < j_end; ++j) {
+				RPD::RPDPlane* plane = &(PC->cutted_planes_[j]);
+				plane_check.push_back(RPD_edges_check[std::make_pair(i, plane->opposite_idx())]);
+			}
+
+			// test
+			/*{
+				std::vector<Eigen::Vector3d> o_points;
+				std::vector<Eigen::Vector3i> o_faces;
+				PC->output_planes_disk(5 * sample_dis, o_points, o_faces);
+				std::ofstream oo("..//data//temp.obj");
+				for (int i = 0, i_end = o_points.size(); i < i_end; ++i) {
+					oo << "v" << " " << o_points[i].transpose() << std::endl;
+				}
+				for (int i = 0, i_end = o_faces.size(); i < i_end; ++i) {
+					oo << "f" << " " << o_faces[i].x() + 1 << " " << o_faces[i].y() + 1 << " " << o_faces[i].z() + 1 << std::endl;
+				}
+				oo.close();
+			}*/
+
+			// find base model's nearest face
+			std::vector<std::vector<Eigen::Vector3d>> base_mesh_nearest_faces; // point(i)'s nearest faces of base mesh
+			if (0) {
+				for (int j = 0, j_end = PC->cutted_planes_.size(); j < j_end; ++j) {
+					Eigen::Vector3d plane_cor = PC->cutted_planes_[j].cor();
+					AABB_Point query(plane_cor.x(), plane_cor.y(), plane_cor.z());
+
+					auto pp = base_mesh_aabb_tree.closest_point_and_primitive(query);
+
+					std::vector<Eigen::Vector3d> base_mesh_nearest_f;
+					AABB_Point P1 = pp.second->vertex(0);
+					AABB_Point P2 = pp.second->vertex(1);
+					AABB_Point P3 = pp.second->vertex(2);
+					base_mesh_nearest_f.push_back(Eigen::Vector3d(P1.x(), P1.y(), P1.z()));
+					base_mesh_nearest_f.push_back(Eigen::Vector3d(P2.x(), P2.y(), P2.z()));
+					base_mesh_nearest_f.push_back(Eigen::Vector3d(P3.x(), P3.y(), P3.z()));
+					base_mesh_nearest_faces.push_back(base_mesh_nearest_f);
+				}
+			}
+			else if (1) { // another way
+				std::unordered_set<int> base_mesh_nearest_faces_set;
+				std::vector<std::pair<uint32_t, double>> base_mesh_ret_matches;
+				double cur_search_radius = search_radius;
+				while (1) {
+					const size_t base_mesh_nMatches = base_points_index.radiusSearch(
+						&offset_points_[i].cor()[0], 
+						cur_search_radius,
+						base_mesh_ret_matches,
+						params);
+
+					if (base_mesh_nMatches == 0) {
+						cur_search_radius *= 2;
+					}
+					else {
+						for (int j = 0; j < base_mesh_nMatches; ++j) {
+
+							for (int jj = 0, jj_end = base_point_neighbor_faces[base_mesh_ret_matches[j].first].size(); jj < jj_end; jj++) {
+								base_mesh_nearest_faces_set.insert(base_point_neighbor_faces[base_mesh_ret_matches[j].first][jj]);
+							}
+						}
+						break;
+					}
+				}
+				for (int sf : base_mesh_nearest_faces_set) {
+					std::vector<Eigen::Vector3d> base_mesh_nearest_f;
+					base_mesh_nearest_f.push_back(base_mesh_points[base_mesh_faces[sf].x()]);
+					base_mesh_nearest_f.push_back(base_mesh_points[base_mesh_faces[sf].y()]);
+					base_mesh_nearest_f.push_back(base_mesh_points[base_mesh_faces[sf].z()]);
+					base_mesh_nearest_faces.push_back(base_mesh_nearest_f);
+				}
+			}
+
+			// test
+			/*{
+				std::ofstream out("..//data//temp2.obj");
+				for (int i = 0; i < base_mesh_nearest_faces.size(); ++i) {
+					for (int j = 0; j < 3; ++j) {
+						out << "v " << base_mesh_nearest_faces[i][j].transpose() << endl;
+					}
+					out << "f " << 3 * i + 1 << " " << 3 * i + 2 << " " << 3 * i + 3 << endl;
+				}
+			}*/
+			
+			std::vector<std::vector<RPD::base_mesh_cutted_point>> base_mesh_cutted_faces; // base_mesh_nearest_faces -> cutted by RPD planes, this array is dynamic
+			// process base model's nearest face -> cut by RPD cell
+			for (int j = 0, j_end = base_mesh_nearest_faces.size(); j < j_end; ++j) {
+				const Eigen::Vector3d* cur_base_face_P1 = &base_mesh_nearest_faces[j][0];
+				const Eigen::Vector3d* cur_base_face_P2 = &base_mesh_nearest_faces[j][1];
+				const Eigen::Vector3d* cur_base_face_P3 = &base_mesh_nearest_faces[j][2];
+
+				std::vector<RPD::base_mesh_cutted_point> cf_tmp(3);
+				cf_tmp[0].cor_ = (*cur_base_face_P1);
+				cf_tmp[1].cor_ = (*cur_base_face_P2);
+				cf_tmp[2].cor_ = (*cur_base_face_P3);
+				cf_tmp[0].opposite_id_ = -1;
+				cf_tmp[1].opposite_id_ = -1;
+				cf_tmp[2].opposite_id_ = -1;
+				
+				for (int pi = 0, pi_end = PC->cutted_planes_.size(); pi < pi_end; ++pi) {
+					if (plane_check[pi] == false) {
+						continue;
+					}
+					RPD::RPDPlane* cur_plane = &(PC->cutted_planes_[pi]);
+
+					double f1, f2, f3;
+					f1 = cur_plane->signed_distance_to_plane(*cur_base_face_P1);
+					f2 = cur_plane->signed_distance_to_plane(*cur_base_face_P2);
+					f3 = cur_plane->signed_distance_to_plane(*cur_base_face_P3);
+
+					if ((f1 * f2 < 0) || (f2 * f3 < 0) || (f3 * f1 < 0)) {
+						base_mesh_cutted_faces.emplace_back(cf_tmp);
+					}
+				}
+			}
+
+			// process base mesh cutted faces
+			for (int j = 0, j_end = base_mesh_cutted_faces.size(); j < j_end; ++j) {
+				std::vector<RPD::base_mesh_cutted_point>* cur_f = &(base_mesh_cutted_faces[j]); // cur base_mesh_cutted_face
+
+				for (int k = 0, k_end = PC->cutted_planes_.size(); k < k_end; ++k) { // cut by plane(k)
+					if (cur_f->size() < 3) {
+						break;
+					}
+
+					RPD::RPDPlane* cur_plane = &(PC->cutted_planes_[k]);
+					Eigen::Vector3d* cur_plane_nor = &(cur_plane->nor());
+					double d = cur_plane->cor().dot(*cur_plane_nor);
+
+					RPD::base_mesh_cutted_point* prev_v = &((*cur_f)[cur_f->size() - 1]);
+					double prev_l = prev_v->cor_.dot(*cur_plane_nor);
+					int prev_status = sign(prev_l - d);
+
+					std::vector<RPD::base_mesh_cutted_point> new_cur_f;
+					for (int vj = 0, vj_end = cur_f->size(); vj < vj_end; ++vj) {
+						RPD::base_mesh_cutted_point* v = &(*cur_f)[vj];
+						double l = v->cor_.dot(*cur_plane_nor);
+						int status = sign(l - d);
+
+						if (status != prev_status && prev_status != 0) {
+							double denom = prev_l - l;
+							double lambda1, lambda2;
+
+							if (abs(denom) < EPS) {
+								lambda1 = 0.5;
+								lambda2 = 0.5;
+							}
+							else {
+								lambda1 = (d - l) / denom;
+								lambda2 = 1 - lambda1;
+							}
+
+							RPD::base_mesh_cutted_point new_vertex;
+							new_vertex.cor_ = lambda1 * prev_v->cor_ + lambda2 * v->cor_;
+							new_vertex.opposite_id_ = cur_plane->opposite_idx();
+							new_cur_f.emplace_back(new_vertex);
+						}
+						if (status < 0) {
+							new_cur_f.emplace_back(*v);
+						}
+
+						prev_v = v;
+						prev_status = status;
+						prev_l = l;
+					}
+					cur_f->swap(new_cur_f);
+				}
+			}
+
+			// convert to connection
+			std::map<pair<int, int>, bool> op_edge_set;
+			for (int j = 0, j_end = base_mesh_cutted_faces.size(); j < j_end; ++j) {
+				std::vector<RPD::base_mesh_cutted_point>* cur_f = &(base_mesh_cutted_faces[j]); // cur base_mesh_cutted_face
+
+				if (cur_f->size() < 3) {
+					continue;
+				}
+				for (int vj = 0, vj_end = cur_f->size(); vj < vj_end; ++vj) {
+					RPD::base_mesh_cutted_point* cur_p1 = &(*cur_f)[vj];
+					RPD::base_mesh_cutted_point* cur_p2;
+					if (vj == vj_end - 1) {
+						cur_p2 = &(*cur_f)[0];
+					}
+					else {
+						cur_p2 = &(*cur_f)[vj + 1];
+					}
+					int p1_id = cur_p1->opposite_id_;
+					int p2_id = cur_p2->opposite_id_;
+					if (p1_id == -1 || p2_id == -1) {
+						continue;
+					}
+
+					std::pair<int, int> op_edge = std::make_pair(min(p1_id, p2_id), max(p1_id, p2_id));
+					if (op_edge_set.find(op_edge) == op_edge_set.end()) {
+						op_edge_set[op_edge] = true;
+
+						raw_triangles.push_back(
+							Eigen::Vector3i(i, p1_id, p2_id));
+					}
+				}
+			}
+
+#ifdef DEBUG_SERIAL_RESTRICTED_POWER_DIAGRAM
+			{
+				for (int j = 0, j_end = base_mesh_cutted_faces.size(); j < j_end; ++j) {
+					std::vector<RPD::base_mesh_cutted_point>* cur_f = &(base_mesh_cutted_faces[j]); // cur base_mesh_cutted_face
+
+					if (cur_f->size() < 3) {
+						continue;
+					}
+					RPD::RPDPoint P1((*cur_f).back().cor_);
+					for (int vj = 0, vj_end = cur_f->size(); vj < vj_end; ++vj) {
+						RPD::RPDPoint P2((*cur_f)[vj].cor_);
+						
+						if (P1 < P2) {
+							RPD_cell_edges[std::make_pair(P1, P2)] = i;
+						}
+						else {
+							RPD_cell_edges[std::make_pair(P2, P1)] = i;
+						}
+
+						// for reconstruction
+						RPD_cell_connect_points[i].insert(P1);
+						RPD_cell_connect_points[i].insert(P2);
+
+						P1 = P2;
+					}
+				}
+
+				// convert RPD cell to faces
+				RPD_cell_triangles[i] = std::vector<Eigen::Vector3i>();
+				for (const auto RPD_p : RPD_cell_connect_points[i]) {
+					for (int pi = 0, pi_end = PC->cutted_planes_.size(); pi < pi_end; ++pi) {
+						RPD::RPDPlane* plane1 = &(PC->cutted_planes_[pi]);
+						double f1 = plane1->signed_distance_to_plane(RPD_p.cor_);
+
+						for (int pj = pi + 1, pj_end = PC->cutted_planes_.size(); pj < pj_end; ++pj) {
+							RPD::RPDPlane* plane2 =&(PC->cutted_planes_[pj]);
+							double f2 = plane2->signed_distance_to_plane(RPD_p.cor_);
+
+							if (abs(f1) < EPS && abs(f2) < EPS) {
+								int a, b, c;
+								a = i;
+								b = plane1->opposite_idx();
+								c = plane2->opposite_idx();
+
+								RPD_cell_triangles[i].push_back(Eigen::Vector3i(a, b, c));
+							}
+						}
+					}
+				}
+			}
+#endif
+		} // point(i)
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("process each point");
+		TC.start();
+#endif
+
+		// test
+		/*{
+			std::ofstream out("..//data//temp3.obj");
+			std::map<int, int> origin_to_remained_idx;
+			int p_cnt = 0;
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_delete() == false) {
+					out << "v" << " " << offset_points_[i].cor().transpose() << std::endl;
+					origin_to_remained_idx[i] = p_cnt++;
+				}
+			}
+			for (int i = 0; i < raw_triangles.size(); ++i) {
+				out << "f" << " " 
+					<< origin_to_remained_idx[raw_triangles[i].x()] + 1 << " " 
+					<< origin_to_remained_idx[raw_triangles[i].y()] + 1<< " " 
+					<< origin_to_remained_idx[raw_triangles[i].z()] + 1<< std::endl;
+			}
+			out.close();
+		}*/
+
+		// extract manifold mesh
+		if (0) {
+			GeoBoxApplication co3neReconstruction;
+			co3neReconstruction.add_offset_points(offset_points_);
+			co3neReconstruction.add_raw_triangles(raw_triangles);
+			co3neReconstruction.My_Mesh_Extraction(res_connection);
+		}
+		else {
+			// check if inside other RPD
+			std::map<int, bool> is_inside_other_RPD;
+			for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+				if (offset_points_[i].is_delete()) {
+					continue;
+				}
+
+				is_inside_other_RPD[i] = false;
+				RPD::RPDCell* PC = PCs[i];
+
+				bool flag_RPD_p = false;
+				for (const RPD::RPDPoint RPD_p : RPD_cell_connect_points[i]) {
+					bool flag_j = false;
+					for (int j = 0; j < RT_neighbors[i].size(); j++) {
+						int n_idx = RT_neighbors[i][j];
+
+						if (PCs[n_idx]->cutted_planes_.empty()) {
+							continue;
+						}
+
+						flag_j = false;
+						for (int pj = 0, pj_end = PCs[n_idx]->cutted_planes_.size(); pj < pj_end; pj++) {
+							RPD::RPDPlane* plane = &(PCs[n_idx]->cutted_planes_[pj]);
+
+							double f1 = plane->signed_distance_to_plane(RPD_p.cor_);
+							if (f1 >= 0 || abs(f1) < EPS) {
+								flag_j = true;
+								break;
+							}
+						}
+
+						if (!flag_j) {
+							break;
+						}
+					}
+					if (flag_j) {
+						flag_RPD_p = true;
+						break;
+					}
+				}
+
+				if (!flag_RPD_p) {
+					is_inside_other_RPD[i] = true;
+				}
+			}
+
+			// fix connection
+			std::map<std::pair<int, int>, int> degree_of_edge;
+			for (const auto cell : RPD_cell_triangles) {
+				if (is_inside_other_RPD[cell.first] == 1) {
+					continue;
+				}
+
+				for (int i = 0, i_end = cell.second.size(); i < i_end; ++i) {
+					int a = cell.second[i].x();
+					int b = cell.second[i].y();
+					int c = cell.second[i].z();
+
+					std::pair<int, int> edge_ab(std::min(a, b), std::max(a, b));
+					std::pair<int, int> edge_bc(std::min(b, c), std::max(b, c));
+					std::pair<int, int> edge_ca(std::min(c, a), std::max(c, a));
+
+					if (degree_of_edge.find(edge_ab) == degree_of_edge.end()) {
+						degree_of_edge[edge_ab] = 0;
+					}
+					if (degree_of_edge.find(edge_bc) == degree_of_edge.end()) {
+						degree_of_edge[edge_bc] = 0;
+					}
+					if (degree_of_edge.find(edge_ca) == degree_of_edge.end()) {
+						degree_of_edge[edge_ca] = 0;
+					}
+
+					degree_of_edge[edge_ab]++;
+					degree_of_edge[edge_bc]++;
+					degree_of_edge[edge_ca]++;
+				}
+			}
+			bool fix_done = true;
+			while (fix_done) {
+				fix_done = false;
+
+				for (auto cell : RPD_cell_triangles) {
+					for (int i = 0, i_end = cell.second.size(); i < i_end; i++) {
+						int a = cell.second[i].x();
+						int b = cell.second[i].y();
+						int c = cell.second[i].z();
+
+						if (a == -1 || b == -1 || c == -1) {
+							continue;
+						}
+
+						std::pair<int, int> edge_ab(std::min(a, b), std::max(a, b));
+						std::pair<int, int> edge_bc(std::min(b, c), std::max(b, c));
+						std::pair<int, int> edge_ca(std::min(c, a), std::max(c, a));
+
+						if (degree_of_edge[edge_ab] < 2 || degree_of_edge[edge_bc] < 2 || degree_of_edge[edge_ca] < 2) {
+							if (degree_of_edge[edge_ab] > 2 || degree_of_edge[edge_bc] > 2 || degree_of_edge[edge_ca] > 2) {
+								degree_of_edge[edge_ab]--;
+								degree_of_edge[edge_bc]--;
+								degree_of_edge[edge_ca]--;
+
+								cell.second[i] = Eigen::Vector3i(-1, -1, -1);
+								fix_done = true;
+							}
+						}
+					}
+				}
+			}
+
+			// convert to connection
+			std::vector<Eigen::Vector3i> output_faces_tmp;
+			for (const auto cell : RPD_cell_triangles) {
+				if (is_inside_other_RPD[cell.first] == 1) {
+					continue;
+				}
+				for (int i = 0, i_end = cell.second.size(); i < i_end; ++i) {
+					int a = cell.second[i].x();
+					int b = cell.second[i].y();
+					int c = cell.second[i].z();
+
+					if (a == -1 || b == -1 || c == -1) {
+						continue;
+					}
+					output_faces_tmp.push_back(Eigen::Vector3i(a, b, c));
+				}
+			}
+			// orient face normals
+#pragma omp parallel for
+			for (int i = 0; i < output_faces_tmp.size(); i++) {
+				OffsetPoint* P1 = &(offset_points_[output_faces_tmp[i].x()]);
+				OffsetPoint* P2 = &(offset_points_[output_faces_tmp[i].y()]);
+				OffsetPoint* P3 = &(offset_points_[output_faces_tmp[i].z()]);
+
+				Eigen::Vector3d face_normal = ((*P2).cor() - (*P1).cor()).cross((*P3).cor() - (*P2).cor());
+
+				double dot_check = (*P1).nor().dot(face_normal) + (*P2).nor().dot(face_normal) + (*P3).nor().dot(face_normal);
+				if (dot_check < 0) {
+					output_faces_tmp[i] = Eigen::Vector3i(output_faces_tmp[i].x(), output_faces_tmp[i].z(), output_faces_tmp[i].y());
+				}
+			}
+			res_connection.swap(output_faces_tmp);
+		}
+
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("manifold extract");
+		TC.print_time_count();
+#endif
+		
+#ifdef DEBUG_SERIAL_RESTRICTED_POWER_DIAGRAM
+		{
+			std::ofstream RPD_out(debug_file_path + DEBUG_SERIAL_RESTRICTED_POWER_DIAGRAM + "Restricted_Power_Diagram.obj");
+			std::map<RPD::RPDPoint, int> RPDPoint_to_idx;
+			int pn = 0;
+			for (const auto e : RPD_cell_edges) {
+				RPD::RPDPoint P1 = e.first.first;
+				RPD::RPDPoint P2 = e.first.second;
+
+				if (RPDPoint_to_idx.find(P1) == RPDPoint_to_idx.end()) {
+					RPDPoint_to_idx[P1] = pn++;
+					RPD_out << "v" << " " << P1.cor_.transpose() << " " << "0 0 0" << std::endl;
+				}
+				if (RPDPoint_to_idx.find(P2) == RPDPoint_to_idx.end()) {
+					RPDPoint_to_idx[P2] = pn++;
+					RPD_out << "v" << " " << P2.cor_.transpose() << " " << "0 0 0" << std::endl;
+				}
+				RPD_out << "l" << " " << RPDPoint_to_idx[P1] + 1 << " " << RPDPoint_to_idx[P2] + 1 << std::endl;
+			}
+			for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+				if (offset_points_[i].is_delete() == false) {
+					RPD_out << "v" << " " << offset_points_[i].cor().transpose() << " " << "255 0 0" << std::endl;
+				}
+			}
+			RPD_out.close();
+		}
+#endif
+
+		return 1;
+	}
+
+	int OffsetPoints::reconstruct_mesh_based_on_distance_field(
+		const double offset_dis,
+		const double sample_dis,
+		std::vector<Eigen::Vector3i>& res_connection
+	) {
+		DEBUG_ONLY_COUT("");
+
+		offset_points_size_ = offset_points_.size();
+		if (offset_points_size_ < 3) {
+			DEBUG_ONLY_COUT("offset points nb is zero!");
+			return 0;
+		}
+
+		// init
+#ifdef TIME_COUNT_RECONSTRUCT
+		TimeCount TC;
+		TC.start();
+#endif
+		const double search_radius_ratio = 5;
+		if (num_procs_ == 0) {
+			init_openmp();
+		}
+		clean_offset_points();
+		build_kd_tree_cloud();
+
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("init");
+		TC.start();
+#endif
+
+		std::vector<std::vector<int>> RT_neighbors(offset_points_size_);
+		double feature_weight		= 1 * sample_dis;
+		double non_feature_weight	= 0.3 * sample_dis;
+
+		// build power diagram
+		if (0) { // CGAL regularity triangulation
+			std::vector<double> offset_points_weights(offset_points_.size());
+			for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+				if (offset_points_[i].is_feature()) {
+					offset_points_weights[i] = feature_weight;
+				}
+				else {
+					offset_points_weights[i] = non_feature_weight;
+				}
+			}
+
+			if (build_regularity_triangulation(
+				sample_dis,
+				offset_points_weights,
+				RT_neighbors) == 0) {
+				DEBUG_ONLY_COUT("build regularity triangulation!");
+				return 0;
+			}
+#ifdef TIME_COUNT_RECONSTRUCT
+			TC.count_time("build power diagram");
+			TC.start();
+#endif
+		}
+		else if (1) { // only kd-tree
+			const double connect_angle_constraint = 120;
+			const double connect_feature_distance_ratio = 5;
+			const double connect_general_distance_ratio = 3;
+			const double sq_connect_feature_distance = connect_feature_distance_ratio * connect_feature_distance_ratio * sample_dis * sample_dis;
+			const double sq_connect_general_distance = connect_general_distance_ratio * connect_general_distance_ratio * sample_dis * sample_dis;
+
+			// RT_neighbors.reserve(offset_points_size_);
+			my_kd_tree_t index(3, cloud_, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+#pragma omp parallel for
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_delete() == false) {
+					std::vector<std::pair<uint32_t, double>> ret_matches;
+					nanoflann::SearchParams params;
+					const double search_radius = static_cast<double>(search_radius_ratio * search_radius_ratio * sample_dis * sample_dis);
+					const size_t nMatches = index.radiusSearch(&offset_points_[i].cor()[0], search_radius, ret_matches, params);
+
+					for (int j = 0; j < nMatches; ++j) {
+						int nei_j = ret_matches[j].first;
+						if (offset_points_[nei_j].is_delete() == false &&
+							i != nei_j) {
+							// filter out some cases
+							// case 2: angle
+							{
+								double vh_nb_angle = safetyAcos((offset_points_[i].nor()).dot(offset_points_[nei_j].nor()));
+								if (vh_nb_angle > connect_angle_constraint) {
+									continue;
+								}
+							}
+
+							RT_neighbors[i].push_back(nei_j);
+						}
+					}
+				}
+			}
+#ifdef DEBUG_SERIAL_PROCESSED_REGULAR_TRIANGULATION
+			{
+				std::ofstream rt_vis_out(debug_file_path + DEBUG_SERIAL_PROCESSED_REGULAR_TRIANGULATION + "Regular_Triangulation.obj");
+				std::map<int, int> ori_to_remain_idx;
+				std::map<std::pair<int, int>, int> pair_map;
+				int rt_cnt = 0;
+				for (int i = 0; i < offset_points_size_; ++i) {
+					if (offset_points_[i].is_delete() == false) {
+						rt_vis_out << "v" << " " << offset_points_[i].cor().transpose() << std::endl;
+						ori_to_remain_idx[i] = rt_cnt++;
+					}
+				}
+				for (int i = 0; i < offset_points_size_; ++i) {
+					if (offset_points_[i].is_delete() == false) {
+						for (int j = 0; j < RT_neighbors[i].size(); ++j) {
+							std::pair<int, int> cur_pair(min(i, RT_neighbors[i][j]), max(i, RT_neighbors[i][j]));
+							if (pair_map.find(cur_pair) == pair_map.end()) {
+								rt_vis_out << "l" << " " << ori_to_remain_idx[cur_pair.first] + 1 << " " << ori_to_remain_idx[cur_pair.second] + 1 << std::endl;
+								pair_map[cur_pair] = 1;
+							}
+						}
+					}
+				}
+				rt_vis_out.close();
+			}
+#endif
+#ifdef TIME_COUNT_RECONSTRUCT
+			TC.count_time("build points neighbor for RPD");
+			TC.start();
+#endif
+		}
+		
+		// process each point
+#ifdef DEBUG_SERIAL_POWER_DIAGRAM_CELLS
+		std::vector<RPD::RPDCell*> PCs(offset_points_.size()); // each point's RPD cell
+#endif
+		std::vector<std::list<int>> RPD_connections(offset_points_size_);
+		// process each RPD cell
+#pragma omp parallel for
+		for (int vi = 0; vi < offset_points_size_; ++vi) {
+			/*if (vi % 1000 == 0) {
+				DEBUG_ONLY_COUT("processed point:" << " " << vi);
+			}*/
+
+			if (offset_points_[vi].is_delete() == true) continue; 
+
+			RPD::RPDCell* PC = new RPD::RPDCell(offset_points_[vi].cor());
+			PC->init_cube(0.5 * search_radius_ratio * sample_dis);
+
+			// cut for generating RPD cell
+			for (int j = 0, j_end = RT_neighbors[vi].size(); j < j_end; ++j) {
+				int neighbor_idx = RT_neighbors[vi][j];
+
+				Eigen::Vector3d mid_point;
+				if (1) { // power diagram
+					double w1 = (offset_points_[vi].is_feature())			? feature_weight : non_feature_weight;
+					double w2 = (offset_points_[neighbor_idx].is_feature()) ? feature_weight : non_feature_weight;
+
+					double lambda = 0.5 + 0.5 * (w1 * w1 - w2 * w2) / (offset_points_[vi].cor() - offset_points_[neighbor_idx].cor()).squaredNorm();
+					if (lambda <= 0 || lambda > 1) continue;
+
+					mid_point = (1 - lambda) * offset_points_[vi].cor() + lambda * offset_points_[neighbor_idx].cor();
+				}
+				else { // voronoi diagram
+					mid_point = 0.5 * (offset_points_[vi].cor() + offset_points_[neighbor_idx].cor());
+				}
+
+				Eigen::Vector3d dir = offset_points_[neighbor_idx].cor() - offset_points_[vi].cor();
+
+				PC->cut_by_plane(RPD::RPDPlane(
+					mid_point,
+					dir,
+					neighbor_idx));
+			} // point(i)'s neighbors -> point(j)
+
+#ifdef DEBUG_SERIAL_POWER_DIAGRAM_CELLS
+			PCs[vi] = PC;
+#endif
+
+			// get connection based on distance field
+			const double sign_sq_offset_dis = sign(offset_dis) * offset_dis * offset_dis;
+			if (0) { // using single cutted vertices to judge
+				std::unordered_map<int, std::list<int>> planes_neigbor_vertices;
+				std::vector<int> cutted_vertices_inside(PC->cutted_vertices_.size());
+				for (int j = 0, j_end = PC->cutted_vertices_.size(); j < j_end; ++j) {
+					Eigen::Vector3i* cutted_planes = &(PC->cutted_vertices_[j].first);
+					Eigen::Vector3d* cutted_vertex = &(PC->cutted_vertices_[j].second);
+
+					planes_neigbor_vertices[cutted_planes->x()].push_back(j);
+					planes_neigbor_vertices[cutted_planes->y()].push_back(j);
+					planes_neigbor_vertices[cutted_planes->z()].push_back(j);
+
+					const AABB_Point query((*cutted_vertex).x(), (*cutted_vertex).y(), (*cutted_vertex).z());
+					// double sqd = mesh_->aabb_tree().squared_distance(query);
+
+					Point_and_primitive_id pp = mesh_->aabb_tree().closest_point_and_primitive(query);
+					const AABB_Point cp = pp.first;
+					Eigen::Vector3d project_vec(query.x() - cp.x(), query.y() - cp.y(), query.z() - cp.z());
+					double sqd = project_vec.squaredNorm();
+
+					Face_location query_location = PMP::locate_with_AABB_tree(query, mesh_->aabb_tree(), mesh_->sm_mesh());
+					OM_Mesh::FaceHandle location_fh(query_location.first);
+					Eigen::Vector3d face_normal = mesh_->face_normals()[location_fh.idx()];
+
+					if (project_vec.dot(face_normal) < 0) sqd = -sqd;
+
+					if (sqd > sign_sq_offset_dis) {
+						cutted_vertices_inside[j] = 1;
+					}
+					else {
+						cutted_vertices_inside[j] = 0;
+					}
+				}
+
+				for (auto it : planes_neigbor_vertices) {
+					RPD::RPDPlane* RPD_plane = &(PC->cutted_planes_[it.first]);
+					if (RPD_plane->opposite_idx() == -1) {
+						continue;
+					}
+
+					std::list<int>* vertex_signs = &(it.second);
+					int del_cnt = 0;
+					for (auto l_it : (*vertex_signs)) {
+						del_cnt += cutted_vertices_inside[l_it];
+					}
+
+					if (del_cnt > 0 && del_cnt < vertex_signs->size()) {
+						RPD_connections[vi].push_back(RPD_plane->opposite_idx());
+					}
+				}
+			}
+			else if (0) { // sample cutted edges to judge
+				std::unordered_map<std::pair<int, int>, int, pair_hash> edgefaces_vertex;
+				std::unordered_map<int, std::vector<int>> face_neighbor_faces;
+				for (int j = 0, j_end = PC->cutted_vertices_.size(); j < j_end; ++j) {
+					Eigen::Vector3i* cutted_planes = &(PC->cutted_vertices_[j].first);
+
+					std::pair<int, int> edge1((*cutted_planes).x(), (*cutted_planes).y());
+					std::pair<int, int> edge2((*cutted_planes).y(), (*cutted_planes).z());
+					std::pair<int, int> edge3((*cutted_planes).z(), (*cutted_planes).x());
+
+					edgefaces_vertex[edge1] = j;
+					edgefaces_vertex[edge2] = j;
+					edgefaces_vertex[edge3] = j;
+
+					face_neighbor_faces[(*cutted_planes).x()].push_back((*cutted_planes).y());
+					face_neighbor_faces[(*cutted_planes).y()].push_back((*cutted_planes).z());
+					face_neighbor_faces[(*cutted_planes).z()].push_back((*cutted_planes).x());
+				}
+
+				int edge_sample_num = 10;
+				for (auto fnfs : face_neighbor_faces) { // process each face
+					RPD::RPDPlane* RPD_plane = &(PC->cutted_planes_[fnfs.first]);
+
+					if (RPD_plane->opposite_idx() == -1) {
+						continue;
+					}
+
+					int is_cutted_face = false;
+
+					for (auto neif : fnfs.second) { // process face's each edge
+						std::pair<int, int> cur_edge(fnfs.first, neif);
+						std::pair<int, int> cur_edge_op(neif, fnfs.first);
+
+						int v1 = edgefaces_vertex[cur_edge];
+						int v2 = edgefaces_vertex[cur_edge_op];
+
+						Eigen::Vector3d* cutted_vertex1 = &(PC->cutted_vertices_[v1].second);
+						Eigen::Vector3d* cutted_vertex2 = &(PC->cutted_vertices_[v2].second);
+
+						int del_cnt = 0;
+						for (int j = 0; j < edge_sample_num; ++j) {
+							double lambda = double(j) / (edge_sample_num - 1);
+							Eigen::Vector3d cur_point = lambda * (*cutted_vertex1) + (1 - lambda) * (*cutted_vertex2);
+
+							const AABB_Point query(cur_point.x(), cur_point.y(), cur_point.z());
+							// double sqd = mesh_->aabb_tree().squared_distance(query);
+
+							Point_and_primitive_id pp = mesh_->aabb_tree().closest_point_and_primitive(query);
+							const AABB_Point cp = pp.first;
+							Eigen::Vector3d project_vec(query.x() - cp.x(), query.y() - cp.y(), query.z() - cp.z());
+							double sqd = project_vec.squaredNorm();
+
+							Face_location query_location = PMP::locate_with_AABB_tree(query, mesh_->aabb_tree(), mesh_->sm_mesh());
+							OM_Mesh::FaceHandle location_fh(query_location.first);
+							Eigen::Vector3d face_normal = mesh_->face_normals()[location_fh.idx()];
+
+							if (sqd > sign_sq_offset_dis) {
+								++del_cnt;
+							}
+						}
+
+						if (del_cnt > 0 && del_cnt < edge_sample_num) {
+							is_cutted_face = true;
+							break;
+						}
+					}
+
+					if (is_cutted_face) {
+						RPD_connections[vi].push_back(RPD_plane->opposite_idx());
+					}
+				}
+			}
+			else if (offset_points_[vi].is_feature() == true) { // sphere tracing process to judge
+				std::unordered_map<std::pair<int, int>, bool, pair_hash> edgefaces_cutted;
+				std::unordered_map<std::pair<int, int>, int, pair_hash> edgefaces_vertex;
+				std::unordered_map<int, std::vector<int>> face_neighbor_faces;
+				for (int j = 0, j_end = PC->cutted_vertices_.size(); j < j_end; ++j) {
+					Eigen::Vector3i* cutted_planes = &(PC->cutted_vertices_[j].first);
+
+					std::pair<int, int> edge1((*cutted_planes).x(), (*cutted_planes).y());
+					std::pair<int, int> edge2((*cutted_planes).y(), (*cutted_planes).z());
+					std::pair<int, int> edge3((*cutted_planes).z(), (*cutted_planes).x());
+
+					edgefaces_cutted[edge1] = false;
+					edgefaces_cutted[edge2] = false;
+					edgefaces_cutted[edge3] = false;
+
+					edgefaces_vertex[edge1] = j;
+					edgefaces_vertex[edge2] = j;
+					edgefaces_vertex[edge3] = j;
+
+					face_neighbor_faces[(*cutted_planes).x()].push_back((*cutted_planes).y());
+					face_neighbor_faces[(*cutted_planes).y()].push_back((*cutted_planes).z());
+					face_neighbor_faces[(*cutted_planes).z()].push_back((*cutted_planes).x());
+				}
+
+				for (auto edge_pair = edgefaces_cutted.begin(); edge_pair != edgefaces_cutted.end(); ++edge_pair){ // process each edge
+					if ((*edge_pair).second == true) continue;
+
+					std::pair<int,int> edge = (*edge_pair).first;
+					int f1 = edge.first;
+					int f2 = edge.second;
+					std::pair<int, int> redge(f2, f1);
+
+					Eigen::Vector3d* v1 = &(PC->cutted_vertices_[edgefaces_vertex[edge]].second);
+					Eigen::Vector3d* v2 = &(PC->cutted_vertices_[edgefaces_vertex[redge]].second);
+					double edge_length = ((*v1) - (*v2)).norm();
+					Eigen::Vector3d edge_dir = ((*v2) - (*v1)) / edge_length;
+
+
+					double rolling_dis = 0;
+					Eigen::Vector3d cur_v = *v1;
+					while (1) {
+						const AABB_Point query(cur_v.x(), cur_v.y(), cur_v.z());
+						double qd = sqrt(mesh_->aabb_tree().squared_distance(query));
+						qd -= abs(offset_dis);
+						qd = abs(qd);
+
+						if (qd < 1e-6) {
+							edgefaces_cutted[edge] = true;
+							edgefaces_cutted[redge] = true;
+							break;
+						}
+
+						rolling_dis += qd;
+						if (rolling_dis > edge_length) {
+							break;
+						}
+						else {
+							cur_v += qd * edge_dir;
+						}
+					}
+				}
+
+				for (auto fnfs : face_neighbor_faces) { // process each face
+					RPD::RPDPlane* RPD_plane = &(PC->cutted_planes_[fnfs.first]);
+					if (RPD_plane->opposite_idx() == -1) {
+						continue;
+					}
+
+					int is_cutted_face = false;
+
+					for (auto neif : fnfs.second) { // process face's each edge
+						std::pair<int, int> cur_edge(fnfs.first, neif);
+
+						if (edgefaces_cutted[cur_edge]) {
+							is_cutted_face = true;
+							break;
+						}
+					}
+
+					if (is_cutted_face) {
+						RPD_connections[vi].push_back(RPD_plane->opposite_idx());
+					}
+				}
+			}
+			else if (offset_points_[vi].is_feature() == false) { // cut the cell by disk orthogonal to point normal
+				std::unordered_map<int, std::list<int>> planes_neigbor_vertices;
+				std::vector<int> cutted_vertices_inside(PC->cutted_vertices_.size());
+				for (int j = 0, j_end = PC->cutted_vertices_.size(); j < j_end; ++j) {
+					Eigen::Vector3i* cutted_planes = &(PC->cutted_vertices_[j].first);
+					Eigen::Vector3d* cutted_vertex = &(PC->cutted_vertices_[j].second);
+
+					planes_neigbor_vertices[cutted_planes->x()].push_back(j);
+					planes_neigbor_vertices[cutted_planes->y()].push_back(j);
+					planes_neigbor_vertices[cutted_planes->z()].push_back(j);
+
+					RPD::RPDPlane cut_plane(offset_points_[vi].cor(), offset_points_[vi].nor());
+					if (cut_plane.is_on_positive_side(*cutted_vertex)) {
+						cutted_vertices_inside[j] = 1;
+					}
+					else {
+						cutted_vertices_inside[j] = 0;
+					}
+				}
+
+				for (auto it : planes_neigbor_vertices) {
+					RPD::RPDPlane* RPD_plane = &(PC->cutted_planes_[it.first]);
+					if (RPD_plane->opposite_idx() == -1) {
+						continue;
+					}
+
+					std::list<int>* vertex_signs = &(it.second);
+					int del_cnt = 0;
+					for (auto l_it : (*vertex_signs)) {
+						del_cnt += cutted_vertices_inside[l_it];
+					}
+
+					if (del_cnt > 0 && del_cnt < vertex_signs->size()) {
+						RPD_connections[vi].push_back(RPD_plane->opposite_idx());
+					}
+				}
+			}
+
+#ifndef DEBUG_SERIAL_POWER_DIAGRAM_CELLS
+				delete PC;
+#endif
+		} // point(i)
+		DEBUG_ONLY_COUT("process each RPD cell done!");
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("process power diagram cells");
+#endif
+		// test for output 1 cell
+		/* {
+			RPD::RPDCell* PC = PCs[0];
+
+			std::vector<Eigen::Vector3d> o_points;
+			std::vector<Eigen::Vector3i> o_faces;
+			PC->output_planes_disk(10 * sample_dis, o_points, o_faces);
+			std::ofstream oo("..//data//temp.obj");
+			for (int i = 0, i_end = o_points.size(); i < i_end; ++i) {
+				oo << "v" << " " << o_points[i].transpose() << std::endl;
+			}
+			for (int i = 0, i_end = o_faces.size(); i < i_end; ++i) {
+				oo << "f" << " " << o_faces[i].x() + 1 << " " << o_faces[i].y() + 1 << " " << o_faces[i].z() + 1 << std::endl;
+			}
+			oo.close();
+		}*/
+#ifdef DEBUG_SERIAL_POWER_DIAGRAM_CELLS
+		{
+			std::ofstream out(debug_file_path + DEBUG_SERIAL_POWER_DIAGRAM_CELLS + "Power_Diagram_Cells.obj");
+			std::map<RPD::RPDPoint, int> point_map;
+			int p_cnt = 0;
+			for (int vi = 0, vi_end = PCs.size(); vi < vi_end; ++vi) {
+				// if (offset_points_[vi].is_feature() == false) continue;
+
+				RPD::RPDCell* PC = PCs[vi];
+
+				if (PC != NULL) {
+					std::vector<Eigen::Vector3d> o_points;
+					std::vector<Eigen::Vector2i> o_edges;
+					PC->output_cells(o_points, o_edges);
+
+					for (int i = 0; i < o_points.size(); ++i) {
+						RPD::RPDPoint P(o_points[i]);
+
+						if (point_map.find(P) == point_map.end()) {
+							out << "v" << " " << o_points[i].transpose() << " ";
+
+							const AABB_Point query(P.cor_.x(), P.cor_.y(), P.cor_.z());
+							double sqd = mesh_->aabb_tree().squared_distance(query);
+
+							Point_and_primitive_id pp = mesh_->aabb_tree().closest_point_and_primitive(query);
+							const AABB_Point cp = pp.first;
+							Eigen::Vector3d project_vec(query.x() - cp.x(), query.y() - cp.y(), query.z() - cp.z());
+
+							Face_location query_location = PMP::locate_with_AABB_tree(query, mesh_->aabb_tree(), mesh_->sm_mesh());
+							OM_Mesh::FaceHandle location_fh(query_location.first);
+							Eigen::Vector3d face_normal = mesh_->face_normals()[location_fh.idx()];
+
+							if (project_vec.dot(face_normal) < 0) sqd = -sqd;
+
+							if (sqd > sign(offset_dis) * offset_dis * offset_dis) {
+								out << "0 255 0" << endl;
+							}
+							else {
+								out << "255 0 0" << endl;
+							}
+
+							point_map[P] = p_cnt++;
+						}
+					}
+					for (int i = 0; i < o_edges.size(); ++i) {
+						RPD::RPDPoint P1(o_points[o_edges[i].x()]);
+						RPD::RPDPoint P2(o_points[o_edges[i].y()]);
+						out << "l" << " " << point_map[P1] + 1 << " " << point_map[P2] + 1 << std::endl;
+					}
+					out << "v" << " " << PC->cor_.transpose() << " " << "255 255 255" << std::endl;
+					p_cnt++;
+				}
+			}
+			out.close();
+		}
+#ifdef DEBUG_SERIAL_POWER_DIAGRAM_CELLS_COLOR
+		{
+			std::ofstream out(debug_file_path + DEBUG_SERIAL_POWER_DIAGRAM_CELLS_COLOR + "Power_Diagram_Cells_Color.obj");
+			out << "mtllib ./PowerDiagram_ColorBar.mtl" << std::endl;
+
+			int color_nb = 20;
+			std::vector<std::vector<std::vector<int>>> color_faces(color_nb);
+
+			std::map<RPD::RPDPoint, int> point_map;
+			int p_cnt = 0;
+			for (int vi = 0, vi_end = PCs.size(); vi < vi_end; ++vi) {
+				// if (offset_points_[vi].is_feature() == false) continue;
+
+				int random_color = (rand() % 20);
+				/*
+				if (offset_points_[vi].is_feature() == false) {
+					random_color = 0;
+				}
+				else {
+					random_color = 1;
+				}*/
+
+
+				RPD::RPDCell* PC = PCs[vi];
+
+				if (PC != NULL) {
+					std::vector<Eigen::Vector3d> o_points;
+					std::vector<std::vector<int>> o_faces;
+					PC->output_cells(o_points, o_faces);
+
+					std::vector<RPD::RPDPoint> o_RPDpoints;
+					for (int i = 0; i < o_points.size(); ++i) {
+						RPD::RPDPoint P(o_points[i]);
+						o_RPDpoints.emplace_back(P);
+
+						if (point_map.find(P) == point_map.end()) {
+							out << "v" << " " << o_points[i].transpose() << std::endl;
+							point_map[P] = p_cnt++;
+						}
+					}
+
+					for (int i = 0, i_end = o_faces.size(); i < i_end; ++i) {
+						std::vector<int> faces;
+						for (int j = 0, j_end = o_faces[i].size(); j < j_end; ++j) {
+							faces.push_back(point_map[o_RPDpoints[o_faces[i][j]]]);
+						}
+
+						color_faces[random_color].push_back(faces);
+					}
+				}
+			}
+
+			for (int ci = 0, ci_end = color_nb; ci < ci_end; ++ci) {
+				out << "usemtl" << " " << ci + 1 << std::endl;
+
+				for (auto faces : color_faces[ci]) {
+					out << "f";
+					for (int i = 0, i_end = faces.size(); i < i_end; ++i) {
+						out << " " << faces[i] + 1;
+					}
+					out << std::endl;
+				}
+			}
+			out.close();
+		}
+#endif
+#ifdef DEBUG_SERIAL_RESTRICTED_POWER_DIAGRAM_COLOR
+		{
+			std::ofstream out(debug_file_path + DEBUG_SERIAL_RESTRICTED_POWER_DIAGRAM_COLOR + "Restricted_Power_Diagram.obj");
+			out << "mtllib ./PowerDiagram_ColorBar.mtl" << std::endl;
+
+			std::unordered_map<std::pair<int, int>, int, pair_hash> tri_edge_map;
+			for (int vi = 0; vi < offset_points_size_; ++vi) {
+				if (offset_points_[vi].is_delete() == true) continue; 
+
+				for (auto vit : RPD_connections[vi]) {
+					std::pair<int, int> cur_edge(min(vi, vit), max(vi, vit));
+					if (tri_edge_map.find(cur_edge) == tri_edge_map.end()) {
+						tri_edge_map[cur_edge] = 0;
+					}
+					tri_edge_map[cur_edge]++;
+				}
+			}
+			std::vector<std::vector<std::pair<int, int>>> point_neighbor_faces(offset_points_size_);
+			for (int vi = 0; vi < offset_points_size_; ++vi) {
+				if (offset_points_[vi].is_delete() == true) continue;
+
+				for (auto vit1 = RPD_connections[vi].begin(); vit1 != RPD_connections[vi].end(); ++vit1) {
+					for (auto vit2 = vit1; vit2 != RPD_connections[vi].end(); ++vit2) {
+						if ((*vit1 == *vit2)) continue;
+						std::pair<int, int> cur_edge(min(*vit1, *vit2), max(*vit1, *vit2));
+						if (tri_edge_map.find(cur_edge) != tri_edge_map.end()) {
+							point_neighbor_faces[vi].push_back(cur_edge);
+						}
+					}
+				}
+			}
+			std::vector<std::vector<std::vector<int>>> faces(offset_points_size_);
+			std::map<RPD::RPDPoint, int> point_idx;
+			int p_cnt = 0;
+			for (int vi = 0; vi < offset_points_size_; ++vi) {
+				// if (vi % 1000 == 0) DEBUG_ONLY_COUT(vi);
+				// if (vi > 200) break;
+
+				if (offset_points_[vi].is_delete() == true) continue;
+
+				double w0 = (offset_points_[vi].is_feature()) ? feature_weight : non_feature_weight;
+				for (auto it : point_neighbor_faces[vi]) {
+					int v1 = it.first;
+					int v2 = it.second;
+					double w1 = (offset_points_[v1].is_feature()) ? feature_weight : non_feature_weight;
+					double w2 = (offset_points_[v2].is_feature()) ? feature_weight : non_feature_weight;
+
+					Eigen::Vector3d mid_point1;
+					Eigen::Vector3d mid_point2;
+					if (1) { // power diagram
+						double lambda1 = 0.5 + 0.5 * (w0 * w0 - w1 * w1) / (offset_points_[vi].cor() - offset_points_[v1].cor()).squaredNorm();
+						double lambda2 = 0.5 + 0.5 * (w0 * w0 - w2 * w2) / (offset_points_[vi].cor() - offset_points_[v2].cor()).squaredNorm();
+						mid_point1 = (1 - lambda1) * offset_points_[vi].cor() + lambda1 * offset_points_[v1].cor();
+						mid_point2 = (1 - lambda2) * offset_points_[vi].cor() + lambda2 * offset_points_[v2].cor();
+					}
+					else { // voronoi diagram
+						mid_point1 = 0.5 * (offset_points_[vi].cor() + offset_points_[v1].cor());
+						mid_point2 = 0.5 * (offset_points_[vi].cor() + offset_points_[v2].cor());
+					}
+
+					RPD::RPDPlane P01(mid_point1, offset_points_[v1].cor() - offset_points_[vi].cor());
+					RPD::RPDPlane P02(mid_point2, offset_points_[v2].cor() - offset_points_[vi].cor());
+					RPD::RPDPlane Ptri(offset_points_[vi].cor(), ((offset_points_[v1].cor() - offset_points_[vi].cor()).cross(offset_points_[v2].cor() - offset_points_[vi].cor()).normalized()));
+					Eigen::Vector3d cross_point = get_tri_planes_cutted_point(P01, P02, Ptri);
+
+					RPD::RPDPoint RPD_P0(offset_points_[vi].cor());
+					RPD::RPDPoint RPD_P1(mid_point1);
+					RPD::RPDPoint RPD_P2(mid_point2);
+					RPD::RPDPoint RPD_CP(cross_point);
+					if (point_idx.find(RPD_P0) == point_idx.end()) {
+						out << "v" << " " << RPD_P0.cor_.transpose() << std::endl;
+						point_idx[RPD_P0] = p_cnt++;
+					}
+					if (point_idx.find(RPD_P1) == point_idx.end()) {
+						out << "v" << " " << RPD_P1.cor_.transpose() << std::endl;
+						point_idx[RPD_P1] = p_cnt++;
+					}
+					if (point_idx.find(RPD_P2) == point_idx.end()) {
+						out << "v" << " " << RPD_P2.cor_.transpose() << std::endl;
+						point_idx[RPD_P2] = p_cnt++;
+					}
+					if (point_idx.find(RPD_CP) == point_idx.end()) {
+						out << "v" << " " << RPD_CP.cor_.transpose() << std::endl;
+						point_idx[RPD_CP] = p_cnt++;
+					}
+
+					std::vector<int> face;
+					face.emplace_back(point_idx[RPD_P0]);
+					face.emplace_back(point_idx[RPD_P1]);
+					face.emplace_back(point_idx[RPD_CP]);
+					face.emplace_back(point_idx[RPD_P2]);
+					faces[vi].push_back(face);
+				}
+			}
+
+			// write face
+			for (int vi = 0; vi < offset_points_size_; ++vi) {
+				if (offset_points_[vi].is_delete() == true) continue;
+
+				int random_color = (rand() % 20);
+				out << "usemtl" << " " << random_color + 1 << std::endl;
+
+				for (auto face : faces[vi]) {
+					out << "f";
+					for (auto fv : face) {
+						out << " " << fv + 1;
+					}
+					out << std::endl;
+				}
+			}
+
+			out.close();
+		}
+#endif
+#endif
+
+#ifdef DEBUG_SERIAL_POWER_DIAGRAM_CONNECTIONS
+		{
+			std::ofstream out(debug_file_path + DEBUG_SERIAL_POWER_DIAGRAM_CONNECTIONS + "Power_Diagram_Connections.obj");
+			std::map<int, int> origin_to_remain_idx;
+			int p_cnt = 0;
+			std::map<pair<int, int>, int> edge_map;
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_delete() == false) {
+					out << "v" << " " << offset_points_[i].cor().transpose() << std::endl;
+					origin_to_remain_idx[i] = p_cnt++;
+				}
+			}
+			for (int i = 0; i < offset_points_size_; ++i) {
+				if (offset_points_[i].is_delete() == false) {
+					for (auto it : RPD_connections[i]) {
+						std::pair<int, int> cur_edge(min(i, it), max(i, it));
+						if (edge_map.find(cur_edge) == edge_map.end()) {
+							out << "l" << " " << origin_to_remain_idx[i] + 1 << " " << origin_to_remain_idx[it] + 1 << endl;
+						}
+					}
+				}
+			}
+			out.close();
+		}
+#endif
+
+
+		// extract triangular mesh
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.start();
+#endif
+		std::vector<Eigen::Vector3i> raw_triangles;
+		std::unordered_map<std::pair<int, int>, int, pair_hash> tri_edge_map;
+		for (int vi = 0; vi < offset_points_size_; ++vi) {
+			if (offset_points_[vi].is_delete() == true) continue;
+
+			for (auto vit : RPD_connections[vi]) {
+				std::pair<int, int> cur_edge(min(vi, vit), max(vi, vit));
+				if (tri_edge_map.find(cur_edge) == tri_edge_map.end()) {
+					tri_edge_map[cur_edge] = 0;
+				}
+				tri_edge_map[cur_edge]++;
+			}
+		}
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("extract triangular mesh step 1");
+		TC.start();
+#endif
+		std::vector<Eigen::Vector3i> raw_triangles_fff;
+		std::vector<Eigen::Vector3i> raw_triangles_ffn;
+		std::vector<Eigen::Vector3i> raw_triangles_fnn;
+		std::vector<Eigen::Vector3i> raw_triangles_nnn;
+		for (int vi = 0; vi < offset_points_size_; ++vi) {
+			if (offset_points_[vi].is_delete() == true) continue;
+
+			for (auto vit1 = RPD_connections[vi].begin(); vit1 != RPD_connections[vi].end(); ++vit1) {
+				for (auto vit2 = vit1; vit2 != RPD_connections[vi].end(); ++vit2) {
+					if ((*vit1 == *vit2)) continue;
+
+					double normal_orient1 = offset_points_[vi].nor().dot(offset_points_[*vit1].nor());
+					double normal_orient2 = offset_points_[vi].nor().dot(offset_points_[*vit2].nor());
+					if (normal_orient1 < 0 || normal_orient2 < 0) continue;
+
+					std::pair<int, int> cur_edge(min(*vit1, *vit2), max(*vit1, *vit2));
+					if (tri_edge_map.find(cur_edge) != tri_edge_map.end()) {
+						int feature_point_cnt = 0;
+						if (offset_points_[vi].is_feature()) ++feature_point_cnt;
+						if (offset_points_[*vit1].is_feature()) ++feature_point_cnt;
+						if (offset_points_[*vit2].is_feature()) ++feature_point_cnt;
+						switch (feature_point_cnt) {
+						case 0:
+							raw_triangles_nnn.emplace_back(Eigen::Vector3i(vi, *vit1, *vit2));
+							break;
+						case 1:
+							raw_triangles_fnn.emplace_back(Eigen::Vector3i(vi, *vit1, *vit2));
+							break;
+						case 2:
+							raw_triangles_ffn.emplace_back(Eigen::Vector3i(vi, *vit1, *vit2));
+							break;
+						case 3:
+							raw_triangles_fff.emplace_back(Eigen::Vector3i(vi, *vit1, *vit2));
+							break;
+						}
+					}
+				}
+			}
+		}
+		raw_triangles.insert(raw_triangles.end(), raw_triangles_fff.begin(), raw_triangles_fff.end());
+		raw_triangles.insert(raw_triangles.end(), raw_triangles_ffn.begin(), raw_triangles_ffn.end());
+		raw_triangles.insert(raw_triangles.end(), raw_triangles_fnn.begin(), raw_triangles_fnn.end());
+		raw_triangles.insert(raw_triangles.end(), raw_triangles_nnn.begin(), raw_triangles_nnn.end());
+		std::vector<Eigen::Vector3i>().swap(raw_triangles_fff);
+		std::vector<Eigen::Vector3i>().swap(raw_triangles_ffn);
+		std::vector<Eigen::Vector3i>().swap(raw_triangles_fnn);
+		std::vector<Eigen::Vector3i>().swap(raw_triangles_nnn);
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("extract triangular mesh step 2");
+		TC.start();
+#endif
+
+		GeoBoxApplication co3neReconstruction;
+		co3neReconstruction.add_offset_points(offset_points_);
+		co3neReconstruction.add_raw_triangles(raw_triangles);
+		co3neReconstruction.My_Mesh_Extraction(res_connection);
+		offset_points_size_ = offset_points_.size();
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("co3ne reconstruct");
+		TC.print_time_count();
+#endif
+
+		return 1;
+	}
+
+	int OffsetPoints::check_open_boundaries(
+		const double eps_angle,
+		const double max_length,
+		const std::vector<Eigen::Vector3i>& res_connection,
+		std::vector<int>& res_connection_check
+	) {
+		DEBUG_ONLY_COUT("");
+		if (mesh_->mesh().n_faces() == 0) {
+			DEBUG_ONLY_COUT("original mesh is empty!");
+			return 0;
+		}
+
+#ifdef TIME_COUNT_POSTPROCESS
+		TimeCount TC;
+		TC.start();
+#endif
+		double sq_max_length = max_length * max_length;
+		int connection_size = res_connection.size();
+		res_connection_check = std::vector<int>(res_connection.size(), 0);
+		if (mesh_->is_aabb_tree_valid() == false) {
+			mesh_->build_aabb_tree();
+		}
+#ifdef TIME_COUNT_POSTPROCESS
+		TC.count_time("init");
+		TC.start();
+#endif
+#ifdef DEBUG_SERIAL_CHECK_PROJECTION
+		std::vector<Eigen::Vector3d> query_points(res_connection.size());
+		std::vector<Eigen::Vector3d> project_points(res_connection.size());
+		std::vector<Eigen::Vector3d> project_normals(res_connection.size());
+#endif
+
+#pragma omp parallel for
+		for (int i = 0; i < connection_size; ++i) {
+			OffsetPoint P1 = offset_points_[res_connection[i].x()];
+			OffsetPoint P2 = offset_points_[res_connection[i].y()];
+			OffsetPoint P3 = offset_points_[res_connection[i].z()];
+
+			// length filter
+			/*
+			if (max_length > 0) {
+				if ((P1.cor() - P2.cor()).squaredNorm() > sq_max_length ||
+					(P2.cor() - P3.cor()).squaredNorm() > sq_max_length ||
+					(P3.cor() - P1.cor()).squaredNorm() > sq_max_length) {
+					res_connection_check[i] = 1;
+				}
+			}*/
+
+			// project filter
+			if (eps_angle > EPS) {
+				bool is_filtered = false;
+
+				Eigen::Vector3d query_point = (P1.cor() + P2.cor() + P3.cor()) * 0.3333333333333;
+				AABB_Point query(query_point.x(), query_point.y(), query_point.z());
+				Face_location query_location = PMP::locate_with_AABB_tree(query, mesh_->aabb_tree(), mesh_->sm_mesh());
+
+				OM_Mesh::FaceHandle location_fh(query_location.first);
+				std::vector<Eigen::Vector3d> lf_v;
+				lf_v.reserve(3);
+				std::vector<OM_Mesh::VertexHandle> lf_vh;
+				lf_vh.reserve(3);
+				for (OM_Mesh::FaceVertexIter fvi = mesh_->mesh().fv_begin(location_fh); fvi != mesh_->mesh().fv_end(location_fh); ++fvi) {
+					OM_Mesh::Point fvi_p = mesh_->mesh().point(*fvi);
+					lf_v.push_back(Eigen::Vector3d(fvi_p[0], fvi_p[1], fvi_p[2]));
+					lf_vh.push_back(OM_Mesh::VertexHandle(*fvi));
+				}
+
+				if (mesh_->face_normals().size() == 0) {
+					mesh_->build_face_normals();
+				}
+				AABB_Point projection = mesh_->aabb_tree().closest_point(query);
+				Eigen::Vector3d project_point(projection.x(), projection.y(), projection.z());
+
+				// check points
+				if (is_filtered == false) {
+					double sq_to_v1 = (project_point - lf_v[0]).squaredNorm();
+					double sq_to_v2 = (project_point - lf_v[1]).squaredNorm();
+					double sq_to_v3 = (project_point - lf_v[2]).squaredNorm();
+					if (sq_to_v1 < EPS && mesh_->mesh().is_boundary(lf_vh[0])) {
+						is_filtered = true;
+					}
+					else if (sq_to_v2 < EPS && mesh_->mesh().is_boundary(lf_vh[1])) {
+						is_filtered = true;
+					}
+					else if (sq_to_v3 < EPS && mesh_->mesh().is_boundary(lf_vh[2])) {
+						is_filtered = true;
+					}
+				}
+
+				// check edge
+				if (is_filtered == false) {
+					double sq_to_e12 = (project_point - lf_v[0]).cross((lf_v[1] - lf_v[0]).normalized()).norm();
+					double sq_to_e23 = (project_point - lf_v[1]).cross((lf_v[2] - lf_v[1]).normalized()).norm();
+					double sq_to_e31 = (project_point - lf_v[2]).cross((lf_v[0] - lf_v[2]).normalized()).norm();
+					if (sq_to_e12 < EPS && mesh_->mesh().is_boundary(lf_vh[0]) && mesh_->mesh().is_boundary(lf_vh[1])) {
+						is_filtered = true;
+					}
+					else if (sq_to_e23 < EPS && mesh_->mesh().is_boundary(lf_vh[1]) && mesh_->mesh().is_boundary(lf_vh[2])) {
+						is_filtered = true;
+					}
+					else if (sq_to_e31 < EPS && mesh_->mesh().is_boundary(lf_vh[2]) && mesh_->mesh().is_boundary(lf_vh[0])) {
+						is_filtered = true;
+					}
+				}
+
+				// filter
+				Eigen::Vector3d f_nor(0, 0, 0);
+				if (is_filtered) {
+					Eigen::Vector3d project_vec = query_point - project_point;
+					// f_nor = mesh_.face_normals()[location_fh.idx()]; // projected face normal
+					f_nor = ((P2.cor() - P1.cor()).cross(P3.cor() - P2.cor())).normalized(); // reconstructed face normal
+					
+					double angle = safetyAcos(project_vec.normalized().dot(f_nor));
+					if (angle > eps_angle) {
+						res_connection_check[i] = 2;
+					}
+#ifdef DEBUG_SERIAL_CHECK_PROJECTION
+					query_points[i] = query_point;
+					project_points[i] = project_point;
+					project_normals[i] = f_nor;
+#endif
+				}
+			}
+		}
+#ifdef TIME_COUNT_POSTPROCESS
+		TC.count_time("postprocess");
+		TC.print_time_count();
+#endif
+
+#ifdef DEBUG_SERIAL_CHECK_PROJECTION
+		{
+		int check_point_test = 0;
+			std::ofstream out(debug_file_path + DEBUG_SERIAL_CHECK_PROJECTION + "Check_Projection.obj");
+			for (int i = 0; i < connection_size; ++i) {
+				if (project_normals[i].norm() > EPS) {
+					out << "v" << " " << query_points[i].transpose() << " " << "252 233 79" << std::endl;
+					out << "v" << " " << project_points[i].transpose() << " " << "255 0 0" << std::endl;
+					out << "v" << " " << (query_points[i] + 0.01 * project_normals[i]).transpose() << " " << "0 252 59" << std::endl;
+					out << "l" << " " << 3 * check_point_test + 1 << " " << 3 * check_point_test + 2 << std::endl;
+					out << "l" << " " << 3 * check_point_test + 1 << " " << 3 * check_point_test + 3 << std::endl;
+					out << "l" << " " << 3 * check_point_test + 1 << " " << 3 * check_point_test + 2 << std::endl;
+					++check_point_test;
+				}
+			}
+			out.close();
+		}
+#endif
+
+		return 1;
+	} // remain_open_boundaries
+
+	void OffsetPoints::clean_mesh_connection(std::vector<Eigen::Vector3i>& res_connection) {
+		DEBUG_ONLY_COUT("");
+
+		for (std::vector<Eigen::Vector3i>::iterator it = res_connection.begin(); it != res_connection.end();) {
+			if (offset_points_[(*it).x()].is_delete() == true ||
+				offset_points_[(*it).y()].is_delete() == true ||
+				offset_points_[(*it).z()].is_delete() == true ||
+				offset_points_[(*it).x()].is_feature() ||
+				offset_points_[(*it).y()].is_feature() ||
+				offset_points_[(*it).z()].is_feature()) {
+				it = res_connection.erase(it);
+			}
+			else {
+				it++;
+			}
+		}
+	}
+
+	void OffsetPoints::clean_offset_points() {
+		DEBUG_ONLY_COUT("");
+		std::vector<OffsetPoint> offset_points_tmp;
+		offset_points_tmp.reserve(offset_points_.size());
+		for (auto p = offset_points_.begin(); p != offset_points_.end(); ++p) {
+			if ((*p).is_delete() == false) {
+				offset_points_tmp.push_back((*p));
+			}
+		}
+		offset_points_.swap(offset_points_tmp);
+		(std::vector<OffsetPoint>()).swap(offset_points_tmp);
+		offset_points_size_ = offset_points_.size();
+	}
+
+	int OffsetPoints::build_regularity_triangulation(
+		const double sample_dis,
+		std::vector<double> weights,
+		std::vector<std::vector<int>>& connections) {
+		DEBUG_ONLY_COUT("");
+
+		if (weights.size() != offset_points_.size()) {
+			DEBUG_ONLY_COUT("weights input invalid!");
+			return 0;
+		}
+
+		connections = std::vector<std::vector<int>>(offset_points_.size());
+
+		std::vector<std::pair<Regular_triangulation::Weighted_point, int>> w_points;
+		for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+			if (offset_points_[i].is_delete() == false) {
+				w_points.push_back(
+					std::make_pair(
+						K_WPoint(
+							K_Point(
+								offset_points_[i].cor().x(),
+								offset_points_[i].cor().y(),
+								offset_points_[i].cor().z()),
+							weights[i] * weights[i]), 
+						i)
+				);
+			}
+		}
+
+		// regular triangulation
+		DEBUG_ONLY_COUT("CGAL::Regular_triangulation start");
+		Regular_triangulation RT(w_points.begin(), w_points.end());
+		if (!RT.is_valid()) {
+			DEBUG_ONLY_COUT("CGAL RegularTriangulation::Regular_triangulation error!");
+			return 0;
+		}
+		DEBUG_ONLY_COUT("CGAL::Regular_triangulation done");
+#ifdef DEBUG_SERIAL_REGULAR_TRIANGULATION
+		{
+			std::ofstream rt_vis_out(debug_file_path + DEBUG_SERIAL_REGULAR_TRIANGULATION + "Regular_Triangulation.obj");
+			std::map<Regular_triangulation::Vertex_handle, int> rtvh_map;
+			int rt_cnt = 0;
+			for (const Regular_triangulation::Vertex_handle vh : RT.finite_vertex_handles()) {
+				rtvh_map[vh] = rt_cnt++;
+				rt_vis_out << "v" << " " << vh->point().x() << " " << vh->point().y() << " " << vh->point().z() << std::endl;
+			}
+			for (const Regular_triangulation::Vertex_handle vh : RT.finite_vertex_handles()) {
+				std::vector<Regular_triangulation::Vertex_handle> f_vertices;
+				RT.finite_adjacent_vertices(vh, std::back_inserter(f_vertices));
+				for (auto nb : f_vertices) {
+					rt_vis_out << "l" << " " << rtvh_map[vh] + 1 << " " << rtvh_map[nb] + 1 << endl;
+				}
+			}
+			rt_vis_out.close();
+		}
+#endif
+
+		// process regualr triangulation
+		const double connect_angle_constraint = 100;
+		const double connect_feature_distance_ratio = 5;
+		const double connect_general_distance_ratio = 3;
+		const double sq_connect_feature_distance = connect_feature_distance_ratio * connect_feature_distance_ratio * sample_dis * sample_dis;
+		const double sq_connect_general_distance = connect_general_distance_ratio * connect_general_distance_ratio * sample_dis * sample_dis;
+		for (const Regular_triangulation::Vertex_handle vh : RT.finite_vertex_handles()) {
+			int vh_idx = vh->info();
+			if (vh_idx % 1000 == 0) DEBUG_ONLY_COUT(vh_idx);
+
+			std::vector<Regular_triangulation::Vertex_handle> vh_neighbor;
+			RT.finite_adjacent_vertices(vh, std::back_inserter(vh_neighbor));
+
+			std::vector<int> RT_neighbors_tmp;
+			for (auto nb : vh_neighbor) {
+				int nb_idx = nb->info();
+
+				// filter out some cases
+				// case 1: length
+				if (0) {
+					double nb_sq_length = (offset_points_[vh_idx].cor() - offset_points_[nb_idx].cor()).squaredNorm();
+					if (offset_points_[vh_idx].is_feature() || offset_points_[nb_idx].is_feature()) {
+						if (nb_sq_length > sq_connect_feature_distance) {
+							continue;
+						}
+					}
+					else if (offset_points_[vh_idx].is_boundary() || offset_points_[nb_idx].is_boundary()) {
+						if (nb_sq_length > sq_connect_feature_distance) {
+							continue;
+						}
+					}
+					else {
+						if (nb_sq_length > sq_connect_general_distance) {
+							continue;
+						}
+					}
+				}
+
+				// case 2: angle
+				if (0) {
+					double vh_nb_angle = safetyAcos((offset_points_[vh_idx].nor()).dot(offset_points_[nb_idx].nor()));
+					if (vh_nb_angle > connect_angle_constraint) {
+						continue;
+					}
+				}
+
+				RT_neighbors_tmp.push_back(nb_idx);
+			}
+			connections[vh_idx] = RT_neighbors_tmp;
+		}
+#ifdef DEBUG_SERIAL_PROCESSED_REGULAR_TRIANGULATION
+		{
+			std::ofstream rt_vis(debug_file_path + DEBUG_SERIAL_PROCESSED_REGULAR_TRIANGULATION + "Processed_Regular_Triangulation.obj");
+			std::vector<int> origin_to_remained_idx(offset_points_.size(), -1);
+			int p_cnt = 0;
+			for (int i = 0, i_end = offset_points_.size(); i < i_end;  i++) {
+				if (offset_points_[i].is_delete() == false) {
+					rt_vis << "v" << " " << offset_points_[i].cor().transpose() << std::endl;
+					origin_to_remained_idx[i] = p_cnt++;
+				}
+			}
+			std::map<std::pair<int, int>, bool> edge_map;
+			for (int i = 0, i_end = offset_points_.size(); i < i_end; i++) {
+				if (offset_points_[i].is_delete() == false) {
+					int re_i = origin_to_remained_idx[i];
+					for (int j = 0, j_end = connections[i].size(); j < j_end; j++) {
+						int re_j = origin_to_remained_idx[connections[i][j]];
+
+						std::pair<int, int> pp = std::make_pair(std::min(re_i, re_j), std::max(re_i, re_j));
+						if (edge_map.find(pp) == edge_map.end()) {
+							edge_map[pp] = true;
+							rt_vis << "l" << " " << re_i + 1 << " " << re_j + 1 << std::endl;
+						}
+					}
+				}
+			}
+			rt_vis.close();
+		}
+#endif
+		/*
+		for (auto ch : RT.finite_cell_handles()) {
+
+		}*/
+
+		return 1;
+	}
+
+	int OffsetPoints::build_poisson_model(
+		const double sample_dis,
+		std::vector<Eigen::Vector3d>& points,
+		std::vector<Eigen::Vector3i>& faces
+	) { // this CGAL::poisson_surface_reconstruction_delaunay need to use CGAL::Exact_predicates_inexact_constructions_kernel
+		DEBUG_ONLY_COUT("");
+#ifdef TIME_COUNT_RECONSTRUCT
+		TimeCount TC;
+		TC.start();
+#endif
+
+		points.clear();
+		faces.clear();
+
+		std::vector<K_Pwn> pwn_points;
+		for (int i = 0, i_end = offset_points_.size(); i < i_end; ++i) {
+			if (offset_points_[i].is_delete() == true) continue;
+
+			K_Point kp(
+				offset_points_[i].cor().x(), 
+				offset_points_[i].cor().y(), 
+				offset_points_[i].cor().z());
+			K_Vector kv(
+				offset_points_[i].nor().x(), 
+				offset_points_[i].nor().y(), 
+				offset_points_[i].nor().z());
+			pwn_points.emplace_back(std::make_pair(kp, kv));
+		}
+		DEBUG_ONLY_COUT(pwn_points.size());
+		DEBUG_ONLY_COUT("start poisson reconstruction");
+		Polyhedron output_mesh;
+		if (CGAL::poisson_surface_reconstruction_delaunay(
+			pwn_points.begin(), pwn_points.end(),
+			CGAL::First_of_pair_property_map<K_Pwn>(),
+			CGAL::Second_of_pair_property_map<K_Pwn>(),
+			output_mesh, 0.5 * sample_dis)
+		) {
+			DEBUG_ONLY_COUT("poisson reconstruction done");
+			std::map<Polyhedron::Vertex_handle, int> vh_to_idx;
+			for (Polyhedron::Facet_iterator fi = output_mesh.facets_begin(); fi != output_mesh.facets_end(); ++fi) {
+				std::vector<int> face_vertices_idx;
+				Polyhedron::Face_handle fh = fi;
+
+				Polyhedron::Halfedge_around_facet_circulator fij = fi->facet_begin();
+				do {
+					if (vh_to_idx.find(fij->vertex()) == vh_to_idx.end()) {
+						points.push_back(Eigen::Vector3d(fij->vertex()->point().x(), fij->vertex()->point().y(), fij->vertex()->point().z()));
+						vh_to_idx[fij->vertex()] = points.size() - 1;
+					}
+					face_vertices_idx.push_back(vh_to_idx[fij->vertex()]);
+				} while (++fij != fi->facet_begin());
+
+				if (face_vertices_idx.size() != 3) {
+					DEBUG_ONLY_COUT("CGAL::poisson_surface_reconstruction_delaunay output error!");
+					return 0;
+				}
+
+				faces.push_back(Eigen::Vector3i(face_vertices_idx[0], face_vertices_idx[1], face_vertices_idx[2]));
+			}
+			for (auto vh : vh_to_idx) {
+				points.push_back(Eigen::Vector3d(vh.first->point().x(), vh.first->point().y(), vh.first->point().z()));
+			}
+		}
+		else {
+			DEBUG_ONLY_COUT("CGAL::poisson_surface_reconstruction_delaunay error!");
+			return 0;
+		}
+#ifdef TIME_COUNT_RECONSTRUCT
+		TC.count_time("build poisson model");
+		TC.print_time_count();
+#endif
+
+#ifdef DEBUG_SERIAL_POISSON_RECONSTRUCTION
+		{
+			std::ofstream out(debug_file_path + DEBUG_SERIAL_POISSON_RECONSTRUCTION + "Poisson_Reconstruction.obj");
+			for (int i = 0, i_end = points.size(); i < i_end; ++i) {
+				out << "v" << " " << points[i].transpose() << std::endl;
+			}
+			for (int i = 0, i_end = faces.size(); i < i_end; ++i) {
+				out << "f" << " " << faces[i].x() + 1 << " " << faces[i].y() + 1 << " " << faces[i].z() + 1 << std::endl;
+			}
+			out.close();
+		}
+#endif
+
+		return 1;
+	}
+
+	void OffsetPoints::random_group_points(
+		const int group_size,
+		std::vector<int>& group_labels) {
+
+		build_kd_tree_cloud();
+
+
+	}
+
+	const std::vector<OffsetPoint>& OffsetPoints::offset_points() const {
+		return offset_points_;
+	}
+
+	const int OffsetPoints::num_procs() const {
+
+		return num_procs_;
+	}
+
+} // namespace MeshOffsetStructure

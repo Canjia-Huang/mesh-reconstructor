@@ -8,13 +8,14 @@
 // Eigen
 #include <Eigen/Dense>
 
-namespace MeshReconstructor {
+namespace MeshReconstructor
+{
     int read_OBJ_points(
         const std::string input_file_path,
-        std::vector<Eigen::Vector3d>& points,
-        std::vector<Eigen::Vector3d>& normals,
-        std::vector<double>& weights
-    ){
+        std::vector<Eigen::Vector3d> &points,
+        std::vector<Eigen::Vector3d> &normals,
+        std::vector<double> &weights
+        ){
         DEBUG_ONLY_COUT("");
 
         // init
@@ -24,18 +25,18 @@ namespace MeshReconstructor {
 
         // read file
         std::ifstream in(input_file_path);
-	    if (!in.good()){
+        if (!in.good()){
             DEBUG_ONLY_COUT("read input file failed!");
             return 0;
         }
         std::string sline, s0;
         std::string vertex_char = "v";
         std::string normal_char = "vt";
-        while (getline(in, sline)) {
+        while (getline(in, sline)){
             std::istringstream ins(sline);
             ins >> s0;
 
-            if (s0 == vertex_char) {
+            if (s0 == vertex_char){
                 Eigen::Vector3d p;
                 ins >> p.x() >> p.y() >> p.z();
                 points.push_back(p);
@@ -51,13 +52,13 @@ namespace MeshReconstructor {
         // check input
         DEBUG_ONLY_COUT("read done");
         DEBUG_ONLY_COUT("input point size:" << " " << points.size());
-        if (normals.size() > 0) {
+        if (normals.size() > 0){
             if (points.size() != normals.size()){
-            DEBUG_ONLY_COUT("input normals size may error!");
+                DEBUG_ONLY_COUT("input normals size may error!");
             }
-            else {
+            else{
                 DEBUG_ONLY_COUT("input normal size:" << " " << normals.size());
-            } 
+            }
         }
 
         return 1;
@@ -65,10 +66,10 @@ namespace MeshReconstructor {
 
     int read_XYZ_points(
         const std::string input_file_path,
-        std::vector<Eigen::Vector3d>& points,
-        std::vector<Eigen::Vector3d>& normals,
-        std::vector<double>& weights
-    ){
+        std::vector<Eigen::Vector3d> &points,
+        std::vector<Eigen::Vector3d> &normals,
+        std::vector<double> &weights
+        ){
         DEBUG_ONLY_COUT("");
 
         // init
@@ -78,12 +79,12 @@ namespace MeshReconstructor {
 
         // read file
         std::ifstream in(input_file_path);
-	    if (!in.good()){
+        if (!in.good()){
             DEBUG_ONLY_COUT("read input file failed!");
             return 0;
         }
         std::string sline;
-        while (getline(in, sline)) {
+        while (getline(in, sline)){
             std::istringstream ins(sline);
 
             Eigen::Vector3d p;
@@ -108,19 +109,19 @@ namespace MeshReconstructor {
         // check input
         DEBUG_ONLY_COUT("read done");
         DEBUG_ONLY_COUT("input point size:" << " " << points.size());
-        if (normals.size() > 0) {
-            if (points.size() != normals.size()) {
+        if (normals.size() > 0){
+            if (points.size() != normals.size()){
                 DEBUG_ONLY_COUT("input normals size may error!");
             }
-            else {
+            else{
                 DEBUG_ONLY_COUT("input normal size:" << " " << normals.size());
             }
         }
-        if (weights.size() > 0) {
-            if (points.size() != weights.size()) {
+        if (weights.size() > 0){
+            if (points.size() != weights.size()){
                 DEBUG_ONLY_COUT("input weights size may error!");
             }
-            else {
+            else{
                 DEBUG_ONLY_COUT("input weight size:" << " " << weights.size());
             }
         }
@@ -130,10 +131,10 @@ namespace MeshReconstructor {
 
     int read_OFF_points(
         const std::string input_file_path,
-        std::vector<Eigen::Vector3d>& points,
-        std::vector<Eigen::Vector3d>& normals,
-        std::vector<double>& weights
-    ){
+        std::vector<Eigen::Vector3d> &points,
+        std::vector<Eigen::Vector3d> &normals,
+        std::vector<double> &weights
+        ){
         DEBUG_ONLY_COUT("");
 
         // init
@@ -143,14 +144,14 @@ namespace MeshReconstructor {
 
         std::string OFF_identify;
         int vertex_num;
-		int face_num;
-		int edge_num;
-		int s;
+        int face_num;
+        int edge_num;
+        int s;
         std::string sline;
 
         // read file
         std::ifstream in(input_file_path);
-        if (!in.good()) {
+        if (!in.good()){
             DEBUG_ONLY_COUT("read input file failed!");
             return 0;
         }
@@ -168,16 +169,16 @@ namespace MeshReconstructor {
             getline(in, sline);
             std::istringstream ins(sline);
             ins >> vertex_num >> face_num >> edge_num;
-            for (int i = 0; i < vertex_num; ++i) {
+            for (int i = 0; i < vertex_num; ++i){
                 getline(in, sline);
-                std::istringstream ins_s(sline); 
+                std::istringstream ins_s(sline);
 
                 Eigen::Vector3d p;
                 ins_s >> p.x() >> p.y() >> p.z();
                 points.push_back(p);
             }
         }
-        
+
         in.close();
 
         DEBUG_ONLY_COUT("read done");
@@ -188,10 +189,10 @@ namespace MeshReconstructor {
 
     int read_points(
         const std::string input_file_path,
-        std::vector<Eigen::Vector3d>& points,
-        std::vector<Eigen::Vector3d>& normals,
-        std::vector<double>& weights
-    ){
+        std::vector<Eigen::Vector3d> &points,
+        std::vector<Eigen::Vector3d> &normals,
+        std::vector<double> &weights
+        ){
         DEBUG_ONLY_COUT("");
 
         std::string back = input_file_path.substr(input_file_path.length() - 3, input_file_path.length());
@@ -200,29 +201,78 @@ namespace MeshReconstructor {
                 input_file_path,
                 points,
                 normals,
-                weights
-            );
+                weights);
         }
         else if (back == "xyz"){
             return read_XYZ_points(
                 input_file_path,
                 points,
                 normals,
-                weights
-            );
+                weights);
         }
         else if (back == "off"){
             return read_OFF_points(
                 input_file_path,
                 points,
                 normals,
-                weights
-            );
+                weights);
         }
         else{
             DEBUG_ONLY_COUT("input file type invalid!");
             return 0;
         }
+
+        return 1;
+    }
+
+    int write_OBJ_points(
+        const std::string output_file_path,
+        std::vector<Eigen::Vector3d> &points
+        ){
+        DEBUG_ONLY_COUT("");
+
+        if (points.size() == 0){
+            DEBUG_ONLY_COUT("output point size is zero!");
+            return 0;
+        }
+
+        std::ofstream out(output_file_path);
+        for (int i = 0, i_end = points.size(); i < i_end; ++i){
+            out << "v" << " " << points[i].transpose() << std::endl;
+        }
+        out.close();
+
+        return 1;
+    }
+
+    int write_OBJ_points(
+        const std::string output_file_path,
+        std::vector<Eigen::Vector3d> &points,
+        std::vector<Eigen::Vector3d> &normals,
+        double normal_length
+        ){
+        DEBUG_ONLY_COUT("");
+
+        if (points.size() == 0){
+            DEBUG_ONLY_COUT("output point size is zero!");
+            return 0;
+        }
+        if (points.size() != normals.size()){
+            DEBUG_ONLY_COUT("output normal size is invalid!");
+            return 0;
+        }
+        if (normal_length <= 0){
+            DEBUG_ONLY_COUT("output normal length is invalid!");
+            normal_length = 0.1;
+        }
+
+        std::ofstream out(output_file_path);
+        for (int i = 0, i_end = points.size(); i < i_end; ++i){
+            out << "v" << " " << points[i].transpose() << " " << "40 240 120" << std::endl;
+            out << "v" << " " << (points[i] + normal_length * normals[i]).transpose() << " " << "0 0 0" << std::endl;
+            out << "l" << " " << 2 * i + 1 << " " << 2 * i + 2 << std::endl;
+        }
+        out.close();
 
         return 1;
     }

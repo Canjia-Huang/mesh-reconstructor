@@ -86,6 +86,44 @@ namespace MeshReconstructor {
 	protected:
 		Eigen::Vector3d cor_;
 	};
+
+	class Point_with_normal: public Point{
+	public:
+		Point_with_normal() {
+			cor_ = Eigen::Vector3d(0, 0, 0);
+			nor_ = Eigen::Vector3d(0, 0, 0);
+		};
+
+		~Point_with_normal() {
+			cor_ = Eigen::Vector3d(0, 0, 0);
+			nor_ = Eigen::Vector3d(0, 0, 0);
+		}
+
+		Point_with_normal(double x, double y, double z, double nx, double ny, double nz) {
+			cor_.x() = x;
+			cor_.y() = y;
+			cor_.z() = z;
+			nor_.x() = nx;
+			nor_.y() = ny;
+			nor_.z() = nz;
+		}
+
+		Point_with_normal(const Eigen::Vector3d& cor, const Eigen::Vector3d& nor) {
+			cor_ = cor;
+			nor_ = nor;
+		}
+
+		double& nx() { return nor_.x();}
+
+		double& ny() { return nor_.y();}
+
+		double& nz() { return nor_.z();}
+
+		Eigen::Vector3d& nor() { return nor_; }
+
+	protected:
+		Eigen::Vector3d nor_;
+	};
 }
 
 #endif
