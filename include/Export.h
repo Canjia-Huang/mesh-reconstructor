@@ -9,6 +9,10 @@
 #define DEBUG_ONLY_COUT(x)
 #endif
 
+#ifdef DEBUG_OUTPUT
+#define DEBUG_OUTPUT_POISSON_MODEL  "Poisson_Model.obj"
+#endif
+
 #define MR_EPS 1e-12
 
 #endif

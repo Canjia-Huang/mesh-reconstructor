@@ -18,6 +18,7 @@ typedef std::pair<K_Point, K_Vector>	    K_Pwn;
 #include <CGAL/Polyhedron_3.h>
 typedef CGAL::Polyhedron_3<Kernel>		Polyhedron;
 #include <CGAL/poisson_surface_reconstruction.h>
+#include <CGAL/IO/read_points.h>
 
 namespace MeshReconstructorRPD {
     class Reconstructor{
@@ -73,10 +74,10 @@ namespace MeshReconstructorRPD {
             return 1;
         }
 
-        int build_poisson_base_surface(
-            const double r,
-            std::vector<Eigen::Vector3d> bs_points,
-            std::vector<Eigen::Vector3i> bs_faces
+        int build_poisson_surface(
+            double r,
+            std::vector<Eigen::Vector3d>& bs_points,
+            std::vector<Eigen::Vector3i>& bs_faces
         ){
             DEBUG_ONLY_COUT("");
 
@@ -95,20 +96,27 @@ namespace MeshReconstructorRPD {
                     points_[i].nx(),
                     points_[i].ny(),
                     points_[i].nz());
-                pwn_points.emplace_back(std::make_pair(kp, kv));
+                pwn_points.push_back(std::make_pair(kp, kv));
 		    }
 
-		    Polyhedron output_mesh;
-		    if (CGAL::poisson_surface_reconstruction_delaunay(
+            // get points average
+            if(r <= 0) {
+                r = CGAL::compute_average_spacing<CGAL::Sequential_tag>
+                (pwn_points, 6, CGAL::parameters::point_map(CGAL::First_of_pair_property_map<K_Pwn>()));
+                DEBUG_ONLY_COUT("input r is invalid, use CGAL::compute_average_spacing() to get r=" << r);
+            }
+
+            Polyhedron output_mesh;
+		    /*if (CGAL::poisson_surface_reconstruction_delaunay(
                     pwn_points.begin(), pwn_points.end(),
                     CGAL::First_of_pair_property_map<K_Pwn>(),
                     CGAL::Second_of_pair_property_map<K_Pwn>(),
                     output_mesh, r) == false
 		    ){
-                DEBUG_ONLY_COUT("CGAL::poisson_surface_reconstruction_delaunay error!");
+                DEBUG_ONLY_COUT("CGAL::poisson_surface_reconstruction_delaunay() error!");
                 return 0;
             }
-            else{
+             else{
                 std::map<Polyhedron::Vertex_handle, int> vh_to_idx;
                 for (Polyhedron::Facet_iterator fi = output_mesh.facets_begin(); fi != output_mesh.facets_end(); ++fi) {
                     std::vector<int> face_vertices_idx;
@@ -133,7 +141,23 @@ namespace MeshReconstructorRPD {
                 for (auto vh : vh_to_idx) {
                     bs_points.push_back(Eigen::Vector3d(vh.first->point().x(), vh.first->point().y(), vh.first->point().z()));
                 }
-            }
+                
+#ifdef DEBUG_OUTPUT_POISSON_MODEL
+                {
+                    std::ofstream out(std::string(OUTPUT_PATH) + DEBUG_OUTPUT_POISSON_MODEL);
+                    for (int i = 0, i_end = bs_points.size(); i < i_end; ++i){
+                        out << "v" << " " << bs_points[i].transpose() << std::endl;
+                    }
+                    for (int i = 0, i_end = bs_faces.size(); i < i_end; ++i){
+                        out << "f" << " "
+                        << bs_faces[i].x() + 1 << " "
+                        << bs_faces[i].y() + 1 << " "
+                        << bs_faces[i].z() + 1 << std::endl;
+                    }
+                    out.close();
+                }
+#endif
+            }*/
         
             return 1;
         }

@@ -196,21 +196,21 @@ namespace MeshReconstructor
         DEBUG_ONLY_COUT("");
 
         std::string back = input_file_path.substr(input_file_path.length() - 3, input_file_path.length());
-        if (back == "obj"){
+        if (back == "obj" || back == "OBJ"){
             return read_OBJ_points(
                 input_file_path,
                 points,
                 normals,
                 weights);
         }
-        else if (back == "xyz"){
+        else if (back == "xyz" || back == "XYZ"){
             return read_XYZ_points(
                 input_file_path,
                 points,
                 normals,
                 weights);
         }
-        else if (back == "off"){
+        else if (back == "off" || back == "OFF"){
             return read_OFF_points(
                 input_file_path,
                 points,

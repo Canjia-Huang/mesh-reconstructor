@@ -162,8 +162,8 @@ namespace MeshReconstructorRPD {
 					RPDPlane* plane2 = &(cutted_planes_[(*it)]);
 
 					Eigen::Vector3d cutted_point = get_tri_planes_cutted_point((*plane1), (*plane2), plane);
-					if (isnan(cutted_point.x()) || isnan(cutted_point.y()) || isnan(cutted_point.z()) ||
-						isinf(cutted_point.x()) || isinf(cutted_point.y()) || isinf(cutted_point.z())) {
+					if (std::isnan(cutted_point.x()) || std::isnan(cutted_point.y()) || std::isnan(cutted_point.z()) ||
+						std::isinf(cutted_point.x()) || std::isinf(cutted_point.y()) || std::isinf(cutted_point.z())) {
 
 					}
 					else {
